@@ -1,0 +1,65 @@
+import json
+import re
+from typing import Callable, Optional
+
+import arxiv
+
+from .db import upsert_paper
+
+
+def _normalize_id(entry_id: str) -> str:
+    """Extract canonical arXiv ID (no version suffix) from a full URL or bare ID.
+
+    Examples:
+        http://arxiv.org/abs/2206.01832v3 -> 2206.01832
+        2206.01832v2                       -> 2206.01832
+        math/0123456v1                     -> math/0123456
+    """
+    id_part = entry_id.split("/abs/")[-1]
+    return re.sub(r"v\d+$", "", id_part)
+
+
+def fetch_and_store_papers(
+    query: str,
+    max_results: int = 100,
+    query_tag: str = "semantic",
+    on_paper: Optional[Callable[[int], None]] = None,
+) -> int:
+    """Fetch papers from the arXiv API and store them in SQLite.
+
+    Args:
+        query: arXiv search query string.
+        max_results: Maximum number of papers to retrieve.
+        query_tag: Tag to associate with stored papers ('semantic' or 'structural').
+        on_paper: Optional callback invoked with the cumulative count after each paper stored.
+
+    Returns:
+        Number of papers stored.
+    """
+    client = arxiv.Client(
+        page_size=min(100, max_results),
+        delay_seconds=3.0,
+        num_retries=3,
+    )
+    search = arxiv.Search(
+        query=query,
+        max_results=max_results,
+        sort_by=arxiv.SortCriterion.Relevance,
+    )
+
+    count = 0
+    for result in client.results(search):
+        arxiv_id = _normalize_id(result.entry_id)
+        upsert_paper(
+            arxiv_id=arxiv_id,
+            title=result.title.strip().replace("\n", " "),
+            abstract=result.summary.strip().replace("\n", " "),
+            categories=json.dumps(result.categories),
+            date=result.published.date().isoformat(),
+            query_tag=query_tag,
+        )
+        count += 1
+        if on_paper:
+            on_paper(count)
+
+    return count
