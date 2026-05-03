@@ -36,6 +36,7 @@ def fetch_and_store_papers(
     Returns:
         Number of papers stored.
     """
+    print(f"[DEBUG] arXiv query [{query_tag}]: {query!r}")
     client = arxiv.Client(
         page_size=min(100, max_results),
         delay_seconds=3.0,
@@ -50,6 +51,7 @@ def fetch_and_store_papers(
     count = 0
     for result in client.results(search):
         arxiv_id = _normalize_id(result.entry_id)
+        author_names = [a.name for a in result.authors if a.name]
         upsert_paper(
             arxiv_id=arxiv_id,
             title=result.title.strip().replace("\n", " "),
@@ -57,6 +59,7 @@ def fetch_and_store_papers(
             categories=json.dumps(result.categories),
             date=result.published.date().isoformat(),
             query_tag=query_tag,
+            authors=json.dumps(author_names),
         )
         count += 1
         if on_paper:

@@ -1,12 +1,14 @@
 """Phase 3: Gemma 4 structural analogy verification via Ollama.
 
-Runs a two-step function-calling loop for each candidate bridge pair:
+Two validation modes, controlled by config.GEMMA_SIMPLE_MODE (default: True):
+
+Simple mode (default): single plain-text call per pair — no function calling,
+no think=True.  Works with small models (gemma4:e2b, 2b) on CPU in <20s/pair.
+
+Agentic mode (ARXANON_GEMMA_SIMPLE=0): two-step function-calling loop:
   1. extract_formal_structure — decomposes each abstract into its mathematical form
   2. classify_structural_analogy — compares the two structures and classifies the bridge
-
-Uses think=True for Gemma 4's extended reasoning mode.  Falls back to think=False
-if the thinking field is empty (some Ollama versions or quantisations may not
-populate it).  The reasoning_chain in BridgePair is always non-empty.
+  Uses think=True for Gemma 4's extended reasoning mode with fallback to think=False.
 
 If Ollama is unreachable or the model is not pulled, every public function
 degrades gracefully: check_ollama() returns (False, msg), validate_bridge_pair()
@@ -136,6 +138,9 @@ def check_ollama(
         (True, None) if ready.
         (False, error_message) otherwise — never raises.
     """
+    if config.USE_OPENROUTER:
+        return True, None
+
     import requests  # already a hard dep
 
     try:
@@ -200,6 +205,107 @@ def _chat_with_think_fallback(
         options={"temperature": 0},
     )
     return response, False
+
+
+# ── Simple single-call validation ────────────────────────────────────────────
+
+def _parse_simple_response(text: str) -> dict:
+    """Parse the 3-line structured response from the simple validation prompt.
+
+    Falls back to keyword scan if the model doesn't follow the format.
+    Returns dict with keys: classification, reasoning, matched (list[str]).
+    """
+    import re
+
+    classification = None
+    reasoning = ""
+    matched: list[str] = []
+
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if m := re.match(r"CLASSIFICATION\s*:\s*(\w+)", line, re.IGNORECASE):
+            classification = m.group(1).upper()
+        elif m := re.match(r"REASON\s*:\s*(.+)", line, re.IGNORECASE):
+            reasoning = m.group(1).strip()
+        elif m := re.match(r"MATCHED\s*:\s*(.+)", line, re.IGNORECASE):
+            matched = [s.strip() for s in m.group(1).split(",") if s.strip()]
+
+    valid = {"STRUCTURAL", "METHODOLOGICAL", "THEMATIC", "SUPERFICIAL"}
+    if classification not in valid:
+        upper = text.upper()
+        for kw in ("STRUCTURAL", "METHODOLOGICAL", "THEMATIC", "SUPERFICIAL"):
+            if kw in upper:
+                classification = kw
+                break
+        else:
+            classification = "SUPERFICIAL"
+
+    return {"classification": classification, "reasoning": reasoning, "matched": matched}
+
+
+def _validate_bridge_pair_simple(
+    paper_a: dict,
+    paper_b: dict,
+    sim_score: float,
+    model: str = config.GEMMA_MODEL,
+    base_url: str = config.OLLAMA_BASE_URL,
+    timeout: int = 20,
+) -> Optional["BridgePair"]:
+    """Single-call plain-text validation — no function calling, no think mode.
+
+    Designed for small models (gemma4:e2b, 2b) on CPU.  Completes in <20s/pair.
+    Returns None for SUPERFICIAL classification or on any LLM failure.
+    """
+    cat_a = paper_a.get("categories", "[]")
+    cat_b = paper_b.get("categories", "[]")
+    abstract_a = paper_a.get("abstract", "")[:600]
+    abstract_b = paper_b.get("abstract", "")[:600]
+
+    prompt = (
+        "Compare these two scientific papers and classify their structural relationship.\n\n"
+        f"Paper A [{cat_a}]:\n{abstract_a}\n\n"
+        f"Paper B [{cat_b}]:\n{abstract_b}\n\n"
+        "STRUCTURAL = same mathematical/algorithmic form in different fields\n"
+        "METHODOLOGICAL = same technique applied to different problems\n"
+        "THEMATIC = related topic but different formalism\n"
+        "SUPERFICIAL = surface keyword overlap only\n\n"
+        "Reply with exactly these 3 lines:\n"
+        "CLASSIFICATION: [STRUCTURAL|METHODOLOGICAL|THEMATIC|SUPERFICIAL]\n"
+        "REASON: [one sentence]\n"
+        "MATCHED: [property1, property2, property3]"
+    )
+
+    try:
+        from .llm_client import call_llm
+        text = call_llm(prompt, timeout=timeout, temperature=0)
+    except Exception as exc:
+        logger.warning("simple validation failed: %s", exc)
+        return None
+    parsed = _parse_simple_response(text)
+
+    classification = parsed["classification"]
+    if classification == "SUPERFICIAL":
+        return None
+
+    matched = parsed["matched"]
+    reasoning = parsed["reasoning"] or text[:300] or "[No reasoning captured]"
+
+    return BridgePair(
+        paper_a=paper_a.get("arxiv_id", "?"),
+        paper_b=paper_b.get("arxiv_id", "?"),
+        similarity=sim_score,
+        structure_a={"abstract_snippet": paper_a.get("abstract", "")[:200]},
+        structure_b={"abstract_snippet": paper_b.get("abstract", "")[:200]},
+        classification=classification,
+        confidence_tier=_confidence_tier(classification, len(matched)),
+        reasoning_chain=reasoning,
+        matched_properties=matched,
+        mismatched_properties=[],
+        translation_hints=[],
+        think_mode_used=False,
+    )
 
 
 # ── Structure extraction ──────────────────────────────────────────────────────
@@ -277,6 +383,9 @@ def validate_bridge_pair(
         BridgePair if classification is not SUPERFICIAL, None otherwise.
         Also returns None on any Ollama failure (never raises).
     """
+    if config.GEMMA_SIMPLE_MODE:
+        return _validate_bridge_pair_simple(paper_a, paper_b, sim_score, model, base_url, timeout)
+
     half_timeout = max(timeout // 2, 30)
 
     structure_a = extract_formal_structure(
@@ -362,19 +471,48 @@ def validate_bridge_pair(
 
 # ── Cluster validation ────────────────────────────────────────────────────────
 
+def _retrieval_channel(query_tag: str) -> str:
+    """Map a query_tag to 'semantic', 'structural', or 'unknown'."""
+    if query_tag.startswith("sem"):
+        return "semantic"
+    if query_tag.startswith("str"):
+        return "structural"
+    return "unknown"
+
+
 def _get_cross_domain_pairs(
     cluster: BridgeCluster,
     papers: dict[str, dict],
 ) -> list[tuple[str, str, float]]:
-    """Return cross-domain bridge edges, sorted by similarity descending."""
+    """Return bridge edges where papers come from different retrieval channels AND categories.
+
+    When dual-channel tags (sem*/str*) are present, enforces that one paper comes from the
+    semantic channel and the other from the structural channel, in addition to requiring
+    different top-level arXiv categories.
+
+    Falls back to category-only filtering for legacy single-channel tags (q*, adj*).
+    """
     result: list[tuple[str, str, float]] = []
     for id_a, id_b, sim in cluster.bridge_edges:
         pa = papers.get(id_a, {})
         pb = papers.get(id_b, {})
+        tag_a = pa.get("query_tag", "")
+        tag_b = pb.get("query_tag", "")
         cat_a = primary_cat(pa.get("categories", "[]"))
         cat_b = primary_cat(pb.get("categories", "[]"))
-        if cat_a != cat_b:
-            result.append((id_a, id_b, sim))
+
+        ch_a = _retrieval_channel(tag_a)
+        ch_b = _retrieval_channel(tag_b)
+
+        if ch_a != "unknown" and ch_b != "unknown":
+            # Dual-channel mode: require one sem and one str, plus different top-level cats
+            if ch_a != ch_b and cat_a != cat_b:
+                result.append((id_a, id_b, sim))
+        else:
+            # Legacy / single-channel: fall back to category-only check
+            if cat_a != cat_b:
+                result.append((id_a, id_b, sim))
+
     result.sort(key=lambda x: x[2], reverse=True)
     return result
 
@@ -384,6 +522,7 @@ def validate_clusters(
     papers: dict[str, dict],
     top_n_clusters: int = 5,
     max_pairs_per_cluster: int = 20,
+    max_validate: Optional[int] = None,
     on_pair: Optional[Callable[[int, int], None]] = None,
 ) -> list[BridgeCluster]:
     """Run Gemma 4 bridge validation on the top-N clusters.
@@ -394,7 +533,11 @@ def validate_clusters(
         clusters: Full ranked cluster list (sorted by composite score).
         papers: Mapping of arxiv_id → paper metadata (must include abstract).
         top_n_clusters: Validate this many top clusters.
-        max_pairs_per_cluster: Validate at most this many pairs per cluster.
+        max_pairs_per_cluster: Validate at most this many pairs per cluster
+            (used only when max_validate is None).
+        max_validate: Global budget — validate only the top-N pairs by cosine
+            similarity across all clusters combined. When set, overrides
+            max_pairs_per_cluster. Use for testing with lightweight models.
         on_pair: Optional callback(done, total) called after each pair.
 
     Returns:
@@ -402,11 +545,23 @@ def validate_clusters(
     """
     top = clusters[:top_n_clusters]
 
-    # Pre-compute cross-domain pairs for each cluster
-    pairs_per_cluster = [
-        _get_cross_domain_pairs(c, papers)[:max_pairs_per_cluster]
-        for c in top
-    ]
+    if max_validate is not None:
+        # Global top-N: merge all cross-domain pairs, sort by sim desc, take top N
+        tagged: list[tuple[int, str, str, float]] = [
+            (ci, a, b, s)
+            for ci, c in enumerate(top)
+            for a, b, s in _get_cross_domain_pairs(c, papers)
+        ]
+        tagged.sort(key=lambda x: x[3], reverse=True)
+        per_cluster: list[list[tuple[str, str, float]]] = [[] for _ in top]
+        for ci, a, b, s in tagged[:max_validate]:
+            per_cluster[ci].append((a, b, s))
+        pairs_per_cluster = per_cluster
+    else:
+        pairs_per_cluster = [
+            _get_cross_domain_pairs(c, papers)[:max_pairs_per_cluster]
+            for c in top
+        ]
     total_to_validate = sum(len(p) for p in pairs_per_cluster)
     total_done = 0
 

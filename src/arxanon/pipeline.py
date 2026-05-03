@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Callable, Optional
 
 import faiss
@@ -24,15 +25,97 @@ from .semantic_scholar import fetch_and_store_citations
 
 logger = logging.getLogger(__name__)
 
-_STRUCTURAL_SUFFIX = "dynamical systems bifurcation stability analysis mathematical structure"
+def _gemma_expand_queries(query: str) -> list[str]:
+    """Expand a research question into 3 targeted arXiv search queries via LLM.
 
-
-def default_structural_query(semantic_query: str) -> str:
-    """Derive a generic structural companion query from a semantic query.
-
-    Phase 3 will replace this with Gemma 4 structural decomposition.
+    Falls back to [query] (single query) if the LLM is unavailable or response is unparseable.
     """
-    return f"{semantic_query} {_STRUCTURAL_SUFFIX}"
+    print(f"[DEBUG] _gemma_expand_queries called with: {query!r}")
+    try:
+        from .llm_client import call_llm
+        print("[DEBUG] Waiting for LLM query expansion (up to 45s)...")
+        prompt = (
+            "You are helping search arXiv for papers about a research problem. "
+            "Generate 3 specific arXiv search queries that will find the most relevant papers.\n\n"
+            "Rules:\n"
+            "- All 3 queries must be about the SAME topic as the research problem, just from different angles\n"
+            "- Use exact technical terms that appear in paper titles and abstracts\n"
+            "- Each query is 3-6 words maximum\n"
+            "- Do NOT change the subject domain\n\n"
+            "Examples for \"why are LLMs black boxes\":\n"
+            "  mechanistic interpretability transformer circuits\n"
+            "  feature visualization language model neurons\n"
+            "  probing classifiers internal representations LLM\n\n"
+            "Examples for \"protein folding thermodynamics\":\n"
+            "  protein folding free energy landscape\n"
+            "  thermodynamic stability protein structure\n"
+            "  folding funnel kinetics molecular dynamics\n\n"
+            f"Research problem: {query}\n\n"
+            "Reply with exactly 3 queries, one per line.\n"
+            "No numbering. No labels. No explanation."
+        )
+        raw = call_llm(prompt, timeout=45, temperature=0.2)
+        print(f"[DEBUG] LLM raw response:\n---\n{raw}\n---")
+        lines = [re.sub(r"^\d+[\.\)]\s*", "", ln).strip() for ln in raw.splitlines()]
+        queries = [ln for ln in lines if len(ln.split()) >= 2]
+        print(f"[DEBUG] Parsed {len(queries)} queries: {queries}")
+        if 2 <= len(queries) <= 5:
+            print(f"[DEBUG] Using LLM-expanded queries: {queries[:4]}")
+            return queries[:4]
+        print(f"[DEBUG] Query count {len(queries)} outside [2,5] — falling back")
+    except Exception as exc:
+        print(f"[DEBUG] LLM unavailable or failed: {exc!r} — using fallback")
+    print(f"[DEBUG] Fallback: single query [{query!r}]")
+    return [query]
+
+
+def _llm_structural_queries(query: str, semantic_queries: list[str]) -> list[str]:
+    """Generate queries targeting non-cs domains that share the same mathematical structure.
+
+    Given the researcher's problem and the semantic queries already generated, asks the LLM
+    to identify the abstract mathematical structure (equations, dynamical properties,
+    topological features) and produce queries using vocabulary from math.DS, nlin.CD,
+    physics.*, q-bio.* — never cs.* vocabulary.
+
+    Returns up to 3 queries, or [] if the LLM fails.
+    """
+    print(f"[DEBUG] _llm_structural_queries called for: {query!r}")
+    try:
+        from .llm_client import call_llm
+        print("[DEBUG] Waiting for LLM structural query generation (up to 45s)...")
+        sem_text = "\n".join(f"- {q}" for q in semantic_queries)
+        prompt = (
+            "You are helping find cross-domain mathematical analogies in research.\n\n"
+            f"Research problem: {query}\n\n"
+            f"Semantic queries already sent to arXiv (researcher's own domain):\n{sem_text}\n\n"
+            "Task: Identify the underlying mathematical structure of this research problem — "
+            "the abstract equations, dynamical properties, or geometric features, "
+            "independent of the application domain. Then generate 3 arXiv search queries "
+            "that would find papers from COMPLETELY DIFFERENT scientific fields studying "
+            "the SAME mathematical structure with different vocabulary.\n\n"
+            "Target arXiv categories: math.DS, nlin.CD, physics.cond-mat, physics.data-an, "
+            "q-bio.QM, stat.ME — DO NOT target cs.* at all.\n\n"
+            "Use vocabulary natural to those domains. Examples:\n"
+            "  edge-of-stability (ML) → 'delayed bifurcation discrete dynamical systems' "
+            "or 'slow manifold unstable equilibrium passage'\n"
+            "  attention head collapse → 'phase transition symmetry breaking order parameter'\n"
+            "  loss landscape flatness → 'Lyapunov exponent zero eigenvalue center manifold'\n"
+            "  gradient noise → 'stochastic resonance Langevin equation noise-induced transition'\n\n"
+            "Reply with exactly 3 queries, one per line. "
+            "Each query is 3-7 words. No numbering. No labels. No explanation."
+        )
+        raw = call_llm(prompt, timeout=45, temperature=0.2)
+        print(f"[DEBUG] Structural LLM raw response:\n---\n{raw}\n---")
+        lines = [re.sub(r"^\d+[\.\)]\s*", "", ln).strip() for ln in raw.splitlines()]
+        queries = [ln for ln in lines if len(ln.split()) >= 2]
+        print(f"[DEBUG] Parsed {len(queries)} structural queries: {queries}")
+        if 2 <= len(queries) <= 5:
+            print(f"[DEBUG] Using structural queries: {queries[:3]}")
+            return queries[:3]
+        print(f"[DEBUG] Structural query count {len(queries)} outside [2,5] — returning empty")
+    except Exception as exc:
+        print(f"[DEBUG] Structural LLM failed: {exc!r}")
+    return []
 
 
 def embed_and_index_papers() -> int:

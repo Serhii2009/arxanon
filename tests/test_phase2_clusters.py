@@ -42,6 +42,7 @@ def test_composite_score_weights_sum_to_one():
         + config.BRIDGE_WEIGHT_COHERENCE
         + config.BRIDGE_WEIGHT_ISOLATION
         + config.BRIDGE_WEIGHT_TOPOLOGY
+        + config.BRIDGE_WEIGHT_QUERY
     )
     assert abs(total - 1.0) < 1e-9
 

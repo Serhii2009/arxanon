@@ -40,6 +40,7 @@ class BridgeScore:
     structural_coherence: float   # mean pairwise cosine similarity within cluster
     citation_isolation: float     # fraction of paper pairs with no citation relationship
     topological_significance: float  # 0.0 or persistence of the best matching TDA cycle
+    query_relevance: float        # mean cosine sim of cluster papers to query vector
     composite: float              # weighted sum per config weights
 
 
@@ -99,6 +100,8 @@ class BridgePipelineResult:
     clusters: list[BridgeCluster] # sorted by composite score descending
     gemma_available: bool = False
     gemma_warning: Optional[str] = None
+    query_relevance_scores: dict[str, float] = field(default_factory=dict)
+    direct_cross_domain_pairs: list[BridgePair] = field(default_factory=list)
 
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
@@ -118,6 +121,7 @@ def _score_cluster(
     papers: dict[str, dict],
     citation_pairs: set[frozenset],
     tda_result: TDAResult,
+    query_vector: Optional[np.ndarray] = None,
 ) -> BridgeScore:
     n = len(paper_ids)
 
@@ -163,17 +167,25 @@ def _score_cluster(
                 topo_sig = min(1.0, cycle.persistence)
                 break
 
+    # Query relevance: mean cosine sim of cluster papers to query vector
+    query_relevance = 0.0
+    if query_vector is not None and valid_ids:
+        q_sims = np.array([all_vectors[idx_map[pid]] for pid in valid_ids]) @ query_vector
+        query_relevance = float(np.clip(np.mean(q_sims), 0.0, 1.0))
+
     composite = (
         config.BRIDGE_WEIGHT_DOMAIN * domain_diversity
         + config.BRIDGE_WEIGHT_COHERENCE * structural_coherence
         + config.BRIDGE_WEIGHT_ISOLATION * citation_isolation
         + config.BRIDGE_WEIGHT_TOPOLOGY * topo_sig
+        + config.BRIDGE_WEIGHT_QUERY * query_relevance
     )
     return BridgeScore(
         domain_diversity=domain_diversity,
         structural_coherence=structural_coherence,
         citation_isolation=citation_isolation,
         topological_significance=topo_sig,
+        query_relevance=query_relevance,
         composite=composite,
     )
 
@@ -188,6 +200,7 @@ def run_hdbscan_and_score(
     papers: dict[str, dict],
     citation_pairs: set[frozenset],
     tda_result: TDAResult,
+    query_vector: Optional[np.ndarray] = None,
 ) -> list[BridgeCluster]:
     """Cluster bridge-graph papers with HDBSCAN and score each cluster.
 
@@ -283,6 +296,7 @@ def run_hdbscan_and_score(
             papers=papers,
             citation_pairs=citation_pairs,
             tda_result=tda_result,
+            query_vector=query_vector,
         )
 
         clusters.append(BridgeCluster(

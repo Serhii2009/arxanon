@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS papers (
     categories TEXT NOT NULL,
     date       TEXT NOT NULL,
     query_tag  TEXT NOT NULL DEFAULT '',
+    authors    TEXT NOT NULL DEFAULT '[]',
     created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -33,6 +34,15 @@ def init_db() -> None:
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     with _conn() as conn:
         conn.executescript(_SCHEMA)
+    _migrate_db()
+
+
+def _migrate_db() -> None:
+    with _conn() as conn:
+        try:
+            conn.execute("ALTER TABLE papers ADD COLUMN authors TEXT NOT NULL DEFAULT '[]'")
+        except Exception:
+            pass  # column already exists
 
 
 @contextmanager
@@ -57,20 +67,24 @@ def upsert_paper(
     categories: str,
     date: str,
     query_tag: str = "",
+    authors: str = "[]",
 ) -> None:
     with _conn() as conn:
         conn.execute(
-            """INSERT INTO papers (arxiv_id, title, abstract, categories, date, query_tag)
-               VALUES (?, ?, ?, ?, ?, ?)
+            """INSERT INTO papers (arxiv_id, title, abstract, categories, date, query_tag, authors)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(arxiv_id) DO UPDATE SET
-                   title     = excluded.title,
-                   abstract  = excluded.abstract,
+                   title      = excluded.title,
+                   abstract   = excluded.abstract,
                    categories = excluded.categories,
-                   date      = excluded.date,
-                   query_tag = CASE WHEN excluded.query_tag != ''
-                                    THEN excluded.query_tag
-                                    ELSE papers.query_tag END""",
-            (arxiv_id, title, abstract, categories, date, query_tag),
+                   date       = excluded.date,
+                   authors    = CASE WHEN excluded.authors != '[]'
+                                     THEN excluded.authors
+                                     ELSE papers.authors END,
+                   query_tag  = CASE WHEN excluded.query_tag != ''
+                                     THEN excluded.query_tag
+                                     ELSE papers.query_tag END""",
+            (arxiv_id, title, abstract, categories, date, query_tag, authors),
         )
 
 
