@@ -98,6 +98,7 @@ def run_bridge_pipeline(
     enable_tda: bool = config.TDA_ENABLED,
     on_stage: Optional[Callable[[str, Any], None]] = None,
     query: str = "",
+    query_vector: Optional[np.ndarray] = None,
 ) -> BridgePipelineResult:
     """Run Phase 2: bibcoupling → bridge graph → TDA → HDBSCAN → scoring.
 
@@ -147,17 +148,23 @@ def run_bridge_pipeline(
     index.reconstruct_n(0, index.ntotal, all_vectors)
 
     # Embed query for per-paper relevance scoring (used in cluster scoring + reading list)
-    query_vector: Optional[np.ndarray] = None
+    # Prefer the precomputed vector from Phase 1 (avoids a second model load).
+    query_vector_final: Optional[np.ndarray] = query_vector
     query_relevance_scores: dict[str, float] = {}
-    if query:
+    if query_vector_final is not None:
+        sims = all_vectors @ query_vector_final
+        query_relevance_scores = {
+            arxiv_id: float(sims[idx]) for arxiv_id, idx in idx_map.items()
+        }
+    elif query:
         try:
             from .embedder import Embedder
             _embedder = Embedder(config.EMBED_MODEL)
             q_vecs = _embedder.encode([query], is_query=True)
             q_raw = np.array(q_vecs[0], dtype=np.float32)
             norm = np.linalg.norm(q_raw)
-            query_vector = q_raw / norm if norm > 0 else q_raw
-            sims = all_vectors @ query_vector
+            query_vector_final = q_raw / norm if norm > 0 else q_raw
+            sims = all_vectors @ query_vector_final
             query_relevance_scores = {
                 arxiv_id: float(sims[idx]) for arxiv_id, idx in idx_map.items()
             }
@@ -175,8 +182,8 @@ def run_bridge_pipeline(
             index = faiss.read_index(str(config.FAISS_PATH))
             all_vectors = np.zeros((index.ntotal, index.d), dtype=np.float32)
             index.reconstruct_n(0, index.ntotal, all_vectors)
-            if query_vector is not None:
-                sims = all_vectors @ query_vector
+            if query_vector_final is not None:
+                sims = all_vectors @ query_vector_final
                 query_relevance_scores = {
                     arxiv_id: float(sims[idx]) for arxiv_id, idx in idx_map.items()
                 }
@@ -249,7 +256,7 @@ def run_bridge_pipeline(
         papers=papers,
         citation_pairs=citation_pairs,
         tda_result=tda_result,
-        query_vector=query_vector,
+        query_vector=query_vector_final,
     )
     _emit("clustering_done", len(cluster_list))
 
@@ -317,8 +324,10 @@ _STRUCTURAL_TOP_CATS = {"math", "nlin", "physics", "q-bio", "stat", "econ", "con
 def run_direct_cross_domain_validation(
     result: BridgePipelineResult,
     papers: dict[str, dict],
-    max_pairs: int = 10,
+    max_pairs: int = 50,
     on_pair: Optional[Callable[[int, int], None]] = None,
+    structural_query_map: Optional[dict[str, str]] = None,
+    original_query: str = "",
 ) -> BridgePipelineResult:
     """Validate cross-domain pairs via direct LLM comparison, bypassing the embedding threshold.
 
@@ -376,19 +385,48 @@ def run_direct_cross_domain_validation(
         title_b = pb.get("title", pid_b)[:150]
         abstract_b = pb.get("abstract", "")[:600]
 
+        tag_b = pb.get("query_tag", "")
+        structural_query_str = (structural_query_map or {}).get(tag_b, "")
+
+        translation_ctx = ""
+        if structural_query_str:
+            translation_ctx = (
+                f'Translation context: Paper B was retrieved via the structural query '
+                f'"{structural_query_str}" which was generated as the mathematical/physical '
+                f'vocabulary translation of the researcher\'s ML phenomenon. This query was '
+                f'specifically chosen to find papers from mathematics, physics, or control theory '
+                f'that describe the same underlying phenomenon in non-ML vocabulary. Use this '
+                f'translation as a bridge when evaluating structural correspondence.\n\n'
+            )
+            if original_query:
+                translation_ctx = (
+                    f'Researcher\'s ML phenomenon: "{original_query[:200]}"\n\n'
+                    + translation_ctx
+                )
+
         prompt = (
+            f"{translation_ctx}"
             "Paper A (machine learning domain):\n"
             f"Title: {title_a}\n"
             f"Abstract: {abstract_a}\n\n"
             "Paper B (mathematics/physics domain):\n"
             f"Title: {title_b}\n"
             f"Abstract: {abstract_b}\n\n"
-            "Do these two papers describe the same mathematical structure or phenomenon "
-            "using different domain vocabulary? Answer with one of: STRUCTURAL, "
-            "METHODOLOGICAL, THEMATIC, or NONE. Then in one sentence explain why.\n\n"
-            "Focus on mathematical form, not surface vocabulary. For example, "
-            "'gradient descent near sharp minimum' and 'discrete map near unstable fixed "
-            "point' describe the same mathematical object."
+            "Analyze whether these two papers describe the same mathematical structure "
+            "or phenomenon using different domain vocabulary.\n\n"
+            "Focus on mathematical FORM, not surface vocabulary:\n"
+            "  'gradient descent near sharp minimum' ≡ 'discrete map near unstable fixed point'\n"
+            "  'attention head entropy' ≡ 'symmetry breaking in a coupled oscillator network'\n\n"
+            "Write your analysis in 1-2 sentences, then on the FINAL LINE write exactly one of:\n"
+            "CLASSIFICATION: STRUCTURAL\n"
+            "CLASSIFICATION: METHODOLOGICAL\n"
+            "CLASSIFICATION: THEMATIC\n"
+            "CLASSIFICATION: NONE\n\n"
+            "STRUCTURAL = same mathematical object or mechanism in different domain vocabulary\n"
+            "METHODOLOGICAL = same technique or measurement approach\n"
+            "THEMATIC = related topic, no shared mathematical structure\n"
+            "NONE = no meaningful connection\n\n"
+            "The CLASSIFICATION: line MUST be the last line. Never omit it."
         )
 
         try:
@@ -399,11 +437,12 @@ def run_direct_cross_domain_validation(
                 on_pair(i + 1, total)
             continue
 
-        classification = None
-        for kw in ("STRUCTURAL", "METHODOLOGICAL", "THEMATIC", "NONE"):
-            if kw in text.upper():
-                classification = kw
-                break
+        last_line_match = re.search(
+            r"CLASSIFICATION:\s*(STRUCTURAL|METHODOLOGICAL|THEMATIC|NONE)",
+            text,
+            re.IGNORECASE,
+        )
+        classification = last_line_match.group(1).upper() if last_line_match else None
 
         if on_pair:
             on_pair(i + 1, total)
@@ -411,12 +450,12 @@ def run_direct_cross_domain_validation(
         if not classification or classification == "NONE":
             continue
 
-        reasoning_match = re.search(
-            r"(?:STRUCTURAL|METHODOLOGICAL|THEMATIC|NONE)[.\s]*(.+)",
+        reasoning = re.sub(
+            r"\s*CLASSIFICATION:\s*(?:STRUCTURAL|METHODOLOGICAL|THEMATIC|NONE)\s*$",
+            "",
             text,
-            re.IGNORECASE | re.DOTALL,
-        )
-        reasoning = reasoning_match.group(1).strip()[:400] if reasoning_match else text[:400]
+            flags=re.IGNORECASE,
+        ).strip()[:400] or text[:400]
 
         validated.append(BridgePair(
             paper_a=pid_a,

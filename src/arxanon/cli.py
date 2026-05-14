@@ -510,6 +510,9 @@ def execute_pipeline(
 
     sem_queries = _gemma_expand_queries(query)
     str_queries = _llm_structural_queries(query, sem_queries)
+    structural_query_map: dict[str, str] = {
+        f"str{i + 1}": q for i, q in enumerate(str_queries)
+    }
 
     # Split budget evenly between channels; structural gets nothing if LLM returned no queries
     if str_queries:
@@ -621,7 +624,7 @@ def execute_pipeline(
         task_e = progress.add_task(
             f"[cyan]Encoding with {config.EMBED_MODEL.split('/')[-1]}...[/cyan]"
         )
-        index_size = embed_and_index_papers()
+        index_size, _query_vector = embed_and_index_papers(query)
         progress.update(
             task_e, description=f"[green]✓[/green] {index_size} vectors indexed"
         )
@@ -697,6 +700,7 @@ def execute_pipeline(
             enable_tda=not no_tda,
             on_stage=_on_bridge_stage,
             query=query,
+            query_vector=_query_vector,
         )
 
     papers_embedded = load_papers_with_embeddings()
@@ -764,7 +768,7 @@ def execute_pipeline(
             console=console,
             transient=False,
         ) as progress:
-            task_d = progress.add_task("[cyan]Finding cross-channel pairs...[/cyan]", total=10)
+            task_d = progress.add_task("[cyan]Finding cross-channel pairs...[/cyan]", total=50)
 
             def _on_direct_pair(done: int, total: int) -> None:
                 progress.update(
@@ -777,8 +781,10 @@ def execute_pipeline(
             bridge_result = run_direct_cross_domain_validation(
                 result=bridge_result,
                 papers=papers_embedded,
-                max_pairs=10,
+                max_pairs=50,
                 on_pair=_on_direct_pair,
+                structural_query_map=structural_query_map,
+                original_query=query,
             )
             n_direct = len(bridge_result.direct_cross_domain_pairs)
             if n_direct:

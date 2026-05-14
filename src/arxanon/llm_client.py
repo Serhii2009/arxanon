@@ -32,9 +32,36 @@ def call_llm(
                 "Content-Type": "application/json",
             },
         )
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = _json.loads(r.read())
-        return data["choices"][0]["message"]["content"]
+        import time as _time
+        import urllib.error as _ue
+
+        last_exc: Exception | None = None
+        for _wait in (0, 5, 10):
+            if _wait:
+                _time.sleep(_wait)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    data = _json.loads(r.read())
+                if "choices" in data:
+                    return data["choices"][0]["message"]["content"]
+                elif "content" in data:
+                    return next(
+                        (c["text"] for c in data["content"] if c.get("type") == "text"),
+                        "",
+                    )
+                elif "error" in data:
+                    last_exc = ValueError(f"OpenRouter error: {data['error']}")
+                    continue
+                else:
+                    raise ValueError(
+                        f"Unknown OpenRouter response format: {list(data.keys())}"
+                    )
+            except _ue.HTTPError as exc:
+                if exc.code == 429:
+                    last_exc = exc
+                    continue
+                raise
+        raise last_exc or RuntimeError("OpenRouter: all retries exhausted")
     else:
         import ollama as ollama_lib
 

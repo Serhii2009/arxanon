@@ -1,5 +1,6 @@
 import json
 import re
+import time
 from typing import Callable, Optional
 
 import arxiv
@@ -49,20 +50,31 @@ def fetch_and_store_papers(
     )
 
     count = 0
-    for result in client.results(search):
-        arxiv_id = _normalize_id(result.entry_id)
-        author_names = [a.name for a in result.authors if a.name]
-        upsert_paper(
-            arxiv_id=arxiv_id,
-            title=result.title.strip().replace("\n", " "),
-            abstract=result.summary.strip().replace("\n", " "),
-            categories=json.dumps(result.categories),
-            date=result.published.date().isoformat(),
-            query_tag=query_tag,
-            authors=json.dumps(author_names),
-        )
-        count += 1
-        if on_paper:
-            on_paper(count)
-
+    for attempt in range(2):
+        try:
+            for result in client.results(search):
+                arxiv_id = _normalize_id(result.entry_id)
+                author_names = [a.name for a in result.authors if a.name]
+                upsert_paper(
+                    arxiv_id=arxiv_id,
+                    title=result.title.strip().replace("\n", " "),
+                    abstract=result.summary.strip().replace("\n", " "),
+                    categories=json.dumps(result.categories),
+                    date=result.published.date().isoformat(),
+                    query_tag=query_tag,
+                    authors=json.dumps(author_names),
+                )
+                count += 1
+                if on_paper:
+                    on_paper(count)
+            break
+        except Exception as exc:
+            status = getattr(exc, "status", None) or getattr(exc, "code", None)
+            is_rate_limit = status == 429 or "429" in str(exc) or "rate" in str(exc).lower()
+            if is_rate_limit and attempt == 0:
+                print(f"[WARN] arXiv rate limit ({exc}); waiting 60 s before retry…")
+                time.sleep(60)
+            else:
+                print(f"[WARN] arXiv query [{query_tag}] failed: {exc}; using {count} papers collected so far")
+                break
     return count

@@ -41,7 +41,12 @@ def _gemma_expand_queries(query: str) -> list[str]:
             "- All 3 queries must be about the SAME topic as the research problem, just from different angles\n"
             "- Use exact technical terms that appear in paper titles and abstracts\n"
             "- Each query is 3-6 words maximum\n"
-            "- Do NOT change the subject domain\n\n"
+            "- Do NOT change the subject domain\n"
+            "- Focus on TRAINING DYNAMICS — papers studying temporal evolution DURING training, "
+            "not static behavior of trained models\n"
+            "- Good terms: 'during training', 'training dynamics', 'learning trajectory', "
+            "'gradient dynamics', 'optimization trajectory', 'emergence during training'\n"
+            "- Avoid: applications, inference-time behavior, interpretability of trained models\n\n"
             "Examples for \"why are LLMs black boxes\":\n"
             "  mechanistic interpretability transformer circuits\n"
             "  feature visualization language model neurons\n"
@@ -101,8 +106,20 @@ def _llm_structural_queries(query: str, semantic_queries: list[str]) -> list[str
             "  attention head collapse → 'phase transition symmetry breaking order parameter'\n"
             "  loss landscape flatness → 'Lyapunov exponent zero eigenvalue center manifold'\n"
             "  gradient noise → 'stochastic resonance Langevin equation noise-induced transition'\n\n"
+            "Generate queries ONLY using vocabulary from these fields:\n"
+            "- Numerical analysis and numerical methods (math.NA)\n"
+            "- Dynamical systems and bifurcation theory (math.DS)\n"
+            "- Control theory and optimal control (math.OC)\n"
+            "- Statistical physics and condensed matter (cond-mat.stat-mech)\n"
+            "- Stochastic processes and probability (math.PR)\n"
+            "- Nonlinear dynamics (nlin)\n\n"
+            "Do NOT generate queries using vocabulary from:\n"
+            "- Quantum computing or quantum information\n"
+            "- Quantum mechanics or quantum field theory\n"
+            "- Adiabatic quantum computation\n"
+            "Even if these fields use similar-sounding mathematical terms.\n\n"
             "Reply with exactly 3 queries, one per line. "
-            "Each query is 3-7 words. No numbering. No labels. No explanation."
+            "Each query is 4-6 words. No numbering. No labels. No explanation."
         )
         raw = call_llm(prompt, timeout=45, temperature=0.2)
         print(f"[DEBUG] Structural LLM raw response:\n---\n{raw}\n---")
@@ -118,18 +135,21 @@ def _llm_structural_queries(query: str, semantic_queries: list[str]) -> list[str
     return []
 
 
-def embed_and_index_papers() -> int:
+def embed_and_index_papers(query: str = "") -> tuple[int, Optional[np.ndarray]]:
     """Generate embeddings for any unindexed papers and update the FAISS index.
 
+    If query is provided and papers are embedded in this call, the query is also
+    encoded while the model is still resident — avoiding a second model load later.
+
     Returns:
-        Total number of vectors in the index after this call.
+        (total vectors in index, query_vector or None)
     """
     embedder = Embedder(config.EMBED_MODEL)
     papers = get_papers_without_embeddings()
     index = load_or_create_faiss_index(embedder.dim)
 
     if not papers:
-        return index.ntotal
+        return index.ntotal, None
 
     abstracts = [p["abstract"] for p in papers]
     embeddings = embedder.encode(abstracts, is_query=False)
@@ -141,7 +161,17 @@ def embed_and_index_papers() -> int:
         store_embedding_idx(paper["arxiv_id"], start_idx + i)
 
     save_faiss_index(index)
-    return index.ntotal
+
+    query_vector: Optional[np.ndarray] = None
+    if query:
+        try:
+            q_vecs = embedder.encode([query], is_query=True)
+            q_raw = np.array(q_vecs[0], dtype=np.float32)
+            norm = np.linalg.norm(q_raw)
+            query_vector = q_raw / norm if norm > 0 else q_raw
+        except Exception as exc:
+            logger.warning("Could not embed query: %s", exc)
+    return index.ntotal, query_vector
 
 
 def find_top_similar_pairs(
@@ -299,7 +329,7 @@ def run_search(
     )
     _report("citations_done", None)
 
-    index_size = embed_and_index_papers()
+    index_size, _ = embed_and_index_papers()
     _report("embeddings_done", index_size)
 
     pairs = find_top_similar_pairs(n=5, cross_only=True)

@@ -18,7 +18,7 @@ _DEFAULTS: dict = {
     "gemma_model": "gemma4:e2b",
     "openrouter_api_key": "",
     "max_results": 100,
-    "max_validate": 5,
+    "max_validate": 50,
     "top_clusters": 3,
     "coupling_threshold": 3,
     "setup_done": False,
@@ -39,7 +39,10 @@ def load_settings() -> dict:
     try:
         if _SETTINGS_PATH.exists():
             data = json.loads(_SETTINGS_PATH.read_text(encoding="utf-8"))
-            return {**_DEFAULTS, **data}
+            merged = {**_DEFAULTS, **data}
+            if merged.get("max_validate", 0) < 10:
+                merged["max_validate"] = _DEFAULTS["max_validate"]
+            return merged
     except Exception:
         pass
     return dict(_DEFAULTS)
@@ -148,7 +151,7 @@ def run_setup_wizard(console: Console) -> dict:
     console.print("\n[bold]Step 3: Pipeline settings[/bold]")
     console.print("  [dim]Press Enter to accept defaults.[/dim]\n")
     settings["max_results"] = _prompt_int(console, "Papers fetched per query (max_results)", 100, 10, 500)
-    settings["max_validate"] = _prompt_int(console, "Bridge pairs sent to Gemma (max_validate)", 5, 1, 100)
+    settings["max_validate"] = _prompt_int(console, "Bridge pairs sent to Gemma (max_validate)", settings["max_validate"], 1, 100)
     settings["top_clusters"] = _prompt_int(console, "Clusters shown in output (top_clusters)", 3, 1, 10)
     settings["coupling_threshold"] = _prompt_int(console, "Bibcoupling threshold (coupling_threshold)", 3, 1, 20)
 
@@ -473,7 +476,12 @@ def _gemma_synthesis_panel(
 
     # Top 5 papers by query relevance
     qrs = bridge_result.query_relevance_scores or {}
+    qrs_missing = not qrs and bool(papers)
     top_pids = sorted(qrs, key=qrs.__getitem__, reverse=True)[:5]
+    if not top_pids and papers:
+        str_pids = [pid for pid, p in papers.items() if (p.get("query_tag") or "").startswith("str")]
+        sem_pids = [pid for pid, p in papers.items() if (p.get("query_tag") or "").startswith("sem")]
+        top_pids = (str_pids[:3] + sem_pids[:2])[:5]
     paper_lines: list[str] = []
     for pid in top_pids:
         p = papers.get(pid, {})
@@ -489,20 +497,73 @@ def _gemma_synthesis_panel(
 
     # Bridge findings
     all_validated = [p for c in bridge_result.clusters for p in c.validated_pairs]
-    if all_validated:
+    structural_direct = [
+        p for p in (bridge_result.direct_cross_domain_pairs or [])
+        if p.classification == "STRUCTURAL"
+    ]
+
+    if all_validated or structural_direct:
+        best_pairs = structural_direct[:3] if structural_direct else all_validated[:3]
         bridge_lines: list[str] = []
-        for pair in all_validated[:3]:
+        for pair in best_pairs:
             pa = papers.get(pair.paper_a, {})
             pb = papers.get(pair.paper_b, {})
             ta = pa.get("title", pair.paper_a)
             tb = pb.get("title", pair.paper_b)
+            try:
+                cats = json.loads(pb.get("categories", "[]") or "[]")
+                cat_b = cats[0] if cats else "?"
+            except Exception:
+                cat_b = "?"
             bridge_lines.append(
-                f"- {pair.classification}: arxiv:{pair.paper_a} ({ta[:60]}) "
-                f"↔ arxiv:{pair.paper_b} ({tb[:60]})"
+                f"- {pair.classification}: arxiv:{pair.paper_a} ({ta[:60]})"
+                f" ↔ arxiv:{pair.paper_b} ({tb[:60]}, {cat_b})"
             )
             if pair.reasoning_chain and pair.reasoning_chain != "[No reasoning captured]":
                 bridge_lines.append(f"  Reasoning: {pair.reasoning_chain[:200]}")
         bridge_text = "\n".join(bridge_lines)
+
+        if structural_direct:
+            best = structural_direct[0]
+            pa = papers.get(best.paper_a, {})
+            pb = papers.get(best.paper_b, {})
+            try:
+                cats = json.loads(pb.get("categories", "[]") or "[]")
+                cat_b = cats[0] if cats else "?"
+            except Exception:
+                cat_b = "?"
+            prompt = (
+                f'Researcher asked: "{query}"\n\n'
+                f"Strongest cross-domain connection found:\n"
+                f"ML paper: \"{pa.get('title', best.paper_a)}\" (arxiv:{best.paper_a})\n"
+                f"  Abstract: {(pa.get('abstract') or '')[:300]}\n"
+                f"Math/physics paper: \"{pb.get('title', best.paper_b)}\""
+                f" (arxiv:{best.paper_b}, {cat_b})\n"
+                f"  Abstract: {(pb.get('abstract') or '')[:300]}\n"
+                f"Structural correspondence: {best.reasoning_chain[:300]}\n\n"
+                f"Supporting papers by relevance:\n{papers_text}\n\n"
+                "Your response MUST begin with 'Outside ML,' or 'Outside of ML,' — this is mandatory.\n"
+                "Answer in exactly two paragraphs:\n"
+                "Paragraph 1: What the phenomenon is called outside ML, the field, and the specific "
+                "paper (arxiv ID). Start: 'Outside ML, this is known as [name] in [field] "
+                "(arxiv:[non-CS ID]).'\n"
+                "Paragraph 2: What that paper says about the mechanism, in 2-3 sentences. "
+                "Do NOT mention cosmological phase transitions or any unrelated field."
+            )
+        else:
+            prompt = (
+                f'You are analyzing papers found for this research query: "{query}"\n\n'
+                f"Top papers by relevance:\n{papers_text}\n\n"
+                f"Bridge detector findings:\n{bridge_text}\n\n"
+                "Your response MUST begin with 'Outside ML,' or 'Outside of ML,' if any "
+                "cross-domain connection is found. Answer exactly these three questions in "
+                "plain language, grounded only in what was actually found above. "
+                "Do not invent papers, results, or claims.\n\n"
+                "1. What do the most interesting papers show?\n"
+                "2. Is there any unexpected cross-domain connection in the findings?\n"
+                "3. What is one concrete, mathematically specific next step a researcher could pursue?\n\n"
+                "Keep each answer to 2-3 sentences. No labels or headers — just three paragraphs."
+            )
     elif bridge_result.clusters:
         best = bridge_result.clusters[0]
         cats_str = " ↔ ".join(best.categories[:3]) if best.categories else "?"
@@ -510,37 +571,81 @@ def _gemma_synthesis_panel(
             f"Bridge clusters found ({cats_str}) but Gemma validation produced no confirmed pairs. "
             "Connections are based on embedding similarity only."
         )
+        prompt = (
+            f'You are analyzing papers found for this research query: "{query}"\n\n'
+            f"Top papers by relevance:\n{papers_text}\n\n"
+            f"Bridge detector findings:\n{bridge_text}\n\n"
+            "Your response MUST begin with 'Outside ML,' or 'Outside of ML,' if any "
+            "cross-domain connection is found. Answer exactly these three questions in "
+            "plain language, grounded only in what was actually found above. "
+            "Do not invent papers, results, or claims.\n\n"
+            "1. What do the most interesting papers show?\n"
+            "2. Is there any unexpected cross-domain connection in the findings?\n"
+            "3. What is one concrete, mathematically specific next step a researcher could pursue?\n\n"
+            "Keep each answer to 2-3 sentences. No labels or headers — just three paragraphs."
+        )
     else:
         bridge_text = "No cross-domain bridges found — all papers appear to be from the same domain."
+        prompt = (
+            f'You are analyzing papers found for this research query: "{query}"\n\n'
+            f"Top papers by relevance:\n{papers_text}\n\n"
+            f"Bridge detector findings:\n{bridge_text}\n\n"
+            "Your response MUST begin with 'Outside ML,' or 'Outside of ML,' if any "
+            "cross-domain connection is found. Answer exactly these three questions in "
+            "plain language, grounded only in what was actually found above. "
+            "Do not invent papers, results, or claims.\n\n"
+            "1. What do the most interesting papers show?\n"
+            "2. Is there any unexpected cross-domain connection in the findings?\n"
+            "3. What is one concrete, mathematically specific next step a researcher could pursue?\n\n"
+            "Keep each answer to 2-3 sentences. No labels or headers — just three paragraphs."
+        )
 
-    prompt = (
-        f'You are analyzing papers found for this research query: "{query}"\n\n'
-        f"Top papers by relevance:\n{papers_text}\n\n"
-        f"Bridge detector findings:\n{bridge_text}\n\n"
-        "Answer exactly these three questions in plain language, grounded only in what "
-        "was actually found above. Do not invent papers, results, or claims.\n\n"
-        "1. What do the most interesting papers show?\n"
-        "2. Is there any unexpected cross-domain connection in the findings?\n"
-        "3. What is one concrete, mathematically specific next step a researcher could pursue?\n\n"
-        "Keep each answer to 2-3 sentences. No labels or headers — just three paragraphs."
-    )
-
+    llm_failed = False
     gemma_text = ""
     try:
         gemma_text = call_llm(prompt, timeout=30, temperature=0.3)
     except Exception:
-        pass
+        llm_failed = True
 
     if not gemma_text:
-        if top_pids:
-            p = papers.get(top_pids[0], {})
-            title = p.get("title", top_pids[0])
+        _best = structural_direct[0] if structural_direct else (all_validated[0] if all_validated else None)
+        if _best is not None:
+            _pa = papers.get(_best.paper_a, {})
+            _pb = papers.get(_best.paper_b, {})
+            try:
+                _cats_b = json.loads(_pb.get("categories", "[]") or "[]")
+                _cat_b = _cats_b[0] if _cats_b else "?"
+            except Exception:
+                _cat_b = "?"
+            _n = len(structural_direct) if structural_direct else len(all_validated)
+            _ta = _pa.get("title", _best.paper_a)
+            _tb = _pb.get("title", _best.paper_b)
+            _chain = (_best.reasoning_chain or "[none]")[:250]
             gemma_text = (
-                f"[dim](LLM unavailable — run: ollama serve && ollama pull {config.GEMMA_MODEL})[/dim]\n\n"
-                f"Top result: {title}\n[dim]arxiv:{top_pids[0]}[/dim]"
+                f"✓ {_n} cross-domain structural connection(s) found.\n"
+                "[Synthesis unavailable — network issue]\n\n"
+                "Strongest connection:\n"
+                f"{_tb} (arxiv:{_best.paper_b}, {_cat_b})\n"
+                f"↔ {_ta} (arxiv:{_best.paper_a})\n\n"
+                f"Structural correspondence: {_chain}\n\n"
+                "Open bridge_report.md for full analysis."
             )
         else:
-            gemma_text = "[dim](No results found)[/dim]"
+            gemma_text = "[No cross-domain connections found. Full analysis in bridge_report.md.]"
+
+    prefix_parts: list[str] = []
+    if qrs_missing:
+        prefix_parts.append(
+            "Query relevance scoring unavailable (memory constraint). "
+            "Showing cross-domain bridges found via structural analysis."
+        )
+    if structural_direct and not llm_failed:
+        prefix_parts.append(
+            f"✓ {len(structural_direct)} cross-domain structural connection(s) found"
+            " via direct LLM comparison."
+        )
+    if gemma_text and prefix_parts:
+        gemma_text = "\n\n".join(prefix_parts) + "\n\n" + gemma_text
 
     console.print(
         Panel(
@@ -566,16 +671,20 @@ def _run_search(query: str, console: Console, settings: dict) -> None:
 
     max_validate: Optional[int] = settings.get("max_validate")
 
-    result = execute_pipeline(
-        query=query,
-        max_results=settings.get("max_results", 100),
-        top_clusters=settings.get("top_clusters", 3),
-        max_validate=max_validate,
-        no_gemma=False,
-        no_tda=False,
-        coupling_threshold=settings.get("coupling_threshold", 3),
-        verbose=False,
-    )
+    try:
+        result = execute_pipeline(
+            query=query,
+            max_results=settings.get("max_results", 100),
+            top_clusters=settings.get("top_clusters", 3),
+            max_validate=max_validate,
+            no_gemma=False,
+            no_tda=False,
+            coupling_threshold=settings.get("coupling_threshold", 3),
+            verbose=False,
+        )
+    except Exception as exc:
+        console.print(f"\n  [red]Pipeline error:[/red] {exc}\n  Try again or check your connection.")
+        return
 
     if result:
         bridge_result, papers = result
@@ -600,7 +709,7 @@ def _print_session_header(console: Console, settings: dict) -> None:
         f"  Embedding: [cyan]{embed_label}[/cyan]"
         f"  ·  LLM: [cyan]{llm_label}[/cyan]\n"
         f"  Results: [cyan]{settings.get('max_results', 100)}[/cyan]"
-        f"  ·  Validate: [cyan]{settings.get('max_validate', 5)}[/cyan]"
+        f"  ·  Validate: [cyan]{settings.get('max_validate', 50)}[/cyan]"
         f"  ·  Clusters: [cyan]{settings.get('top_clusters', 3)}[/cyan]"
         f"  ·  [dim]/help for commands[/dim]\n"
     )
