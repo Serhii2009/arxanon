@@ -317,8 +317,26 @@ def run_gemma_validation(
     return result
 
 
-# ── Cross-domain categories targeted by structural channel ────────────────────
-_STRUCTURAL_TOP_CATS = {"math", "nlin", "physics", "q-bio", "stat", "econ", "cond-mat"}
+# ── Non-ML categories excluded from structural channel (full first-category blacklist) ─────────
+_ML_ONLY_CATS = {
+    "cs.LG", "cs.CL", "cs.CV", "cs.AI", "cs.NE",
+    "cs.IR", "cs.RO", "stat.ML",
+}
+
+# Particle physics and astrophysics — excluded because accidental keyword matches
+# (e.g. "hidden", "latent") pull in irrelevant papers that consume validation slots.
+_NOISE_TOP_CATS = frozenset({
+    "hep-ph", "hep-th", "hep-ex", "hep-lat",
+    "gr-qc", "astro-ph", "nucl-th", "nucl-ex",
+})
+
+
+def _full_first_cat(categories_json: str) -> str:
+    try:
+        cats = json.loads(categories_json)
+        return cats[0] if cats else "?"
+    except (json.JSONDecodeError, IndexError, AttributeError):
+        return "?"
 
 
 def run_direct_cross_domain_validation(
@@ -331,9 +349,9 @@ def run_direct_cross_domain_validation(
 ) -> BridgePipelineResult:
     """Validate cross-domain pairs via direct LLM comparison, bypassing the embedding threshold.
 
-    Collects all (sem*, cs.*) × (str*, math.*/nlin.*/physics.*) paper combinations,
-    excludes citation-connected pairs, ranks by sum of query relevance scores, and
-    sends the top N to the LLM for classification.
+    Collects all (sem*, cs.*) × (str*, non-ML papers) combinations, excludes
+    citation-connected pairs, ranks by sum of query relevance scores, and sends
+    the top N to the LLM for classification.
 
     Mutates result.direct_cross_domain_pairs in place and returns result.
     """
@@ -345,10 +363,11 @@ def run_direct_cross_domain_validation(
 
     for pid, p in papers.items():
         tag = p.get("query_tag", "")
-        top_cat = primary_cat(p.get("categories", "[]"))
-        if tag.startswith("sem") and top_cat == "cs":
+        top_prefix = primary_cat(p.get("categories", "[]"))
+        full_cat   = _full_first_cat(p.get("categories", "[]"))
+        if tag.startswith("sem") and top_prefix == "cs":
             sem_cs.append(pid)
-        elif tag.startswith("str") and top_cat in _STRUCTURAL_TOP_CATS:
+        elif tag.startswith("str") and full_cat not in _ML_ONLY_CATS and top_prefix not in _NOISE_TOP_CATS:
             str_other.append(pid)
 
     if not sem_cs or not str_other:
@@ -455,7 +474,7 @@ def run_direct_cross_domain_validation(
             "",
             text,
             flags=re.IGNORECASE,
-        ).strip()[:400] or text[:400]
+        ).strip() or text
 
         validated.append(BridgePair(
             paper_a=pid_a,

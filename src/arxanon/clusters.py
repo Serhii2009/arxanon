@@ -102,6 +102,7 @@ class BridgePipelineResult:
     gemma_warning: Optional[str] = None
     query_relevance_scores: dict[str, float] = field(default_factory=dict)
     direct_cross_domain_pairs: list[BridgePair] = field(default_factory=list)
+    structural_queries: list[str] = field(default_factory=list)
 
 
 # ── Scoring ───────────────────────────────────────────────────────────────────

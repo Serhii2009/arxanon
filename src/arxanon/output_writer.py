@@ -12,6 +12,56 @@ from .clusters import BridgeCluster, BridgePair, BridgePipelineResult
 
 logger = logging.getLogger(__name__)
 
+_CONNECTION_LABELS = {
+    "STRUCTURAL":     "shares the same mathematical mechanism",
+    "METHODOLOGICAL": "uses the same analytical approach",
+    "THEMATIC":       "addresses the same phenomenon from a different angle",
+}
+
+_FIELD_DISTANCE_FROM_CS: dict[str, int] = {
+    "cs":       0,
+    "stat":     1,
+    "math":     2,
+    "eess":     2,
+    "physics":  3,
+    "cond-mat": 3,
+    "nlin":     3,
+    "q-bio":    4,
+    "econ":     4,
+    "q-fin":    4,
+}
+
+_CS_NOISE_SUBCATS = {"cs.HC", "cs.RO", "cs.CR", "cs.MA"}
+
+
+def _is_cs_subfield_noise(pair: "BridgePair", papers: dict) -> bool:
+    pb = papers.get(pair.paper_b, {})
+    try:
+        cats = json.loads(pb.get("categories", "[]") or "[]")
+        return bool(cats) and cats[0] in _CS_NOISE_SUBCATS
+    except Exception:
+        return False
+
+
+def _reasoning_is_surface_only(pair: "BridgePair") -> bool:
+    r = (pair.reasoning_chain or "").lower()
+    return (
+        "do not share a common mathematical mechanism" in r
+        or "they only share the surface-level term" in r
+    )
+
+
+def _field_dist(pair: "BridgePair", papers: dict) -> int:
+    """Return field distance of paper_b from CS (higher = more distant)."""
+    pb = papers.get(pair.paper_b, {})
+    try:
+        cats = json.loads(pb.get("categories", "[]") or "[]")
+        top = cats[0].split(".")[0] if cats else "?"
+    except Exception:
+        top = "?"
+    return _FIELD_DISTANCE_FROM_CS.get(top, 2)
+
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
 def _query_slug(query: str) -> str:
@@ -23,8 +73,8 @@ def save_session(
     query: str,
     bridge_result: BridgePipelineResult,
     papers: dict[str, dict],
-) -> Path:
-    """Save all output files to ./{query_slug}/. Returns the directory path."""
+) -> tuple[Path, Optional[str]]:
+    """Save all output files to ./{query_slug}/. Returns (directory path, synthesis text)."""
     slug = _query_slug(query)
     out_dir = Path(slug)
     if out_dir.exists():
@@ -36,11 +86,11 @@ def save_session(
 
     top_clusters = bridge_result.clusters[:5]
 
-    _write_bridge_report(out_dir, query, bridge_result, papers, top_clusters)
+    directions = _write_bridge_report(out_dir, query, bridge_result, papers, top_clusters)
     _write_sources_bib(out_dir, top_clusters, papers)
     _write_bridge_map(out_dir, top_clusters, papers, bridge_result.direct_cross_domain_pairs or [])
 
-    return out_dir
+    return out_dir, directions
 
 
 # ── Gemma research directions ─────────────────────────────────────────────────
@@ -52,14 +102,33 @@ def _gemma_research_directions(
     direct_pairs: list | None = None,
     papers: dict | None = None,
     str_papers_text: str = "",
+    structural_queries: list[str] | None = None,
+    query_relevance_scores: dict[str, float] | None = None,
 ) -> Optional[str]:
     try:
         from .llm_client import call_llm
 
-        # Build enriched bridge context from structural direct pairs (abstracts + reasoning)
-        structural = [p for p in (direct_pairs or []) if p.classification == "STRUCTURAL"][:3]
+        # Build structural-queries preamble
+        sq_text = ""
+        if structural_queries:
+            sq_lines = "\n".join(f"  {i+1}. {q}" for i, q in enumerate(structural_queries))
+            sq_text = (
+                f"The system translated the ML phenomenon into outside-ML vocabulary "
+                f"and searched arXiv with these structural queries:\n{sq_lines}\n\n"
+            )
+
+        # Build enriched bridge context from top non-NONE pairs (abstracts + reasoning)
+        # Most-distant field first so the LLM sees the novel outside-ML paper at CONNECTION 1
+        _papers_ref = papers or {}
+        top_pairs = sorted(
+            (p for p in (direct_pairs or []) if p.classification != "NONE"),
+            key=lambda p: (
+                -_field_dist(p, _papers_ref),
+                {"STRUCTURAL": 0, "METHODOLOGICAL": 1, "THEMATIC": 2}.get(p.classification, 3),
+            ),
+        )[:3]
         bridge_rich_lines: list[str] = []
-        for i, pair in enumerate(structural, 1):
+        for i, pair in enumerate(top_pairs, 1):
             pa = (papers or {}).get(pair.paper_a, {})
             pb = (papers or {}).get(pair.paper_b, {})
             try:
@@ -67,53 +136,50 @@ def _gemma_research_directions(
                 cat_b = cats_b[0] if cats_b else "?"
             except Exception:
                 cat_b = "?"
+            _abs_a = pa.get("abstract") or ""
+            _abs_b = pb.get("abstract") or ""
             bridge_rich_lines += [
-                f"BRIDGE {i}:",
-                f"  Math/physics paper: \"{pb.get('title', pair.paper_b)}\" (arxiv:{pair.paper_b}, {cat_b})",
-                f"  Abstract: {(pb.get('abstract') or '')[:300]}",
-                f"  ML paper: \"{pa.get('title', pair.paper_a)}\" (arxiv:{pair.paper_a})",
-                f"  Abstract: {(pa.get('abstract') or '')[:300]}",
-                f"  Structural correspondence: {pair.reasoning_chain[:300]}",
+                f"CONNECTION {i}: {pa.get('title', pair.paper_a)} (ML) "
+                f"↔ {pb.get('title', pair.paper_b)} ({cat_b})",
+                f"ML paper (arxiv:{pair.paper_a}):",
+                f"  {(_abs_a[:600] + '…') if len(_abs_a) > 600 else _abs_a}",
+                f"Outside-ML paper (arxiv:{pair.paper_b}, {cat_b}):",
+                f"  {(_abs_b[:600] + '…') if len(_abs_b) > 600 else _abs_b}",
+                f"Why they connect: {pair.reasoning_chain}",
                 "",
             ]
         bridge_context = "\n".join(bridge_rich_lines) if bridge_rich_lines else bridge_pairs_text
 
         if bridge_rich_lines:
             prompt = (
-                f'You are a research assistant. A researcher asked: "{query}"\n\n'
-                f"Cross-domain structural connections found:\n{bridge_context}\n"
+                f'You are writing a research briefing for an ML researcher.\n\n'
+                f'Their question: "{query}"\n\n'
+                f"{sq_text}"
+                f"The following cross-domain connections were validated:\n\n"
+                f"{bridge_context}\n"
                 f"Background ML context:\n{top_papers_text}\n\n"
-                "TASK: Answer the researcher's question directly.\n"
-                "- Name the phenomenon as it is called in the other field.\n"
-                "- Cite every claim with an arXiv ID from above.\n"
-                "- Propose 1 concrete experiment testing the cross-domain connection.\n\n"
-                "Tag every factual claim inline with one of:\n"
-                "  [GROUNDED: arxiv:XXXX] — directly stated or strongly implied by the abstract "
-                "provided above. Use the exact arXiv ID from the BRIDGE block above.\n"
-                "  [INFERRED] — logical inference from what the papers say, not directly stated. "
-                "The researcher should verify it.\n"
-                "  [SPECULATIVE] — goes beyond the papers. Might be true but the researcher must "
-                "evaluate it independently.\n\n"
-                "Example of correct tagging:\n"
-                "\"Critical slowing down is characterized by increasing recovery time from perturbations "
-                "[GROUNDED: arxiv:2208.03881]. This mechanism likely applies to the plateau phase in "
-                "grokking training [INFERRED]. The universal exponents suggest a second-order phase "
-                "transition class [SPECULATIVE].\"\n\n"
-                "MANDATORY: Every sentence containing a factual claim must end with a provenance "
-                "tag before its period. Sentences without a tag will be rejected. The three tags:\n"
-                "  [GROUNDED: arxiv:XXXX] — directly stated or strongly implied by the abstract above\n"
-                "  [INFERRED] — logical deduction from the papers; researcher must verify\n"
+                "Write EXACTLY two sections:\n\n"
+                "**What we found:** (2-3 sentences) Lead with the most interesting outside-ML paper — "
+                "name the field, what that paper found about this phenomenon, and why it matters for "
+                "the researcher's question. Plain English. No classification labels.\n\n"
+                "**Experiment:** Derive the experiment from the outside-ML paper that suggests the "
+                "most ACTIONABLE and NOVEL prediction — one that:\n"
+                "(a) has not already been published in an ML paper\n"
+                "(b) can be tested by varying something in a standard training run (learning rate "
+                "schedule, compute budget, model size trajectory) without requiring specialized "
+                "measurement tools\n"
+                "(c) makes a specific quantitative prediction (not just 'measure if X correlates with Y')\n\n"
+                "Prefer experiments a research lab could run next week over experiments requiring "
+                "months of infrastructure. Do not propose measuring fractal dimensions, activation "
+                "manifold topology, or other quantities requiring custom tooling.\n\n"
+                "Format as: '[Outside-ML mechanism] predicts [specific quantitative outcome]. "
+                "Test: [exact procedure a lab could follow].'\n\n"
+                "Tag every factual claim inline:\n"
+                "  [GROUNDED: arxiv:XXXX] — directly stated in an abstract above\n"
+                "  [INFERRED] — logical deduction from the papers\n"
                 "  [SPECULATIVE] — goes beyond the papers\n\n"
-                "Hard constraint: Never use [GROUNDED: arxiv:X] for a claim not directly stated or "
-                "strongly implied by the abstract text provided above. When in doubt, use [INFERRED] "
-                "rather than [GROUNDED].\n\n"
-                "Format:\n"
-                "**Cross-Domain Finding:** Start with: \"Outside ML, this is studied as [phenomenon name] "
-                "in [field name] (arxiv:[non-CS ID]).\" Then explain the mathematical correspondence "
-                "in 1-2 sentences. Do NOT mention ML paper titles or ML-field citations in this first sentence.\n"
-                "**What the other field says:** [2-3 sentences from the math/physics paper's perspective, "
-                "citing only non-CS papers]\n"
-                "**Experiment:** [one specific testable prediction]\n\n"
+                "Hard constraint: never use [GROUNDED: arxiv:X] for a claim not directly in "
+                "the abstract text above. When uncertain, use [INFERRED].\n"
                 "Ground every claim in the actual papers listed. Do not invent results."
             )
         else:
@@ -124,13 +190,14 @@ def _gemma_research_directions(
             )
             prompt = (
                 f'Research query: "{query}"\n\n'
+                f"{sq_text}"
                 f"Top papers by relevance:\n{top_papers_text}\n"
                 f"{str_section}\n"
                 f"Validated bridge connections:\n{bridge_pairs_text}\n\n"
-                "Your response MUST begin with 'Outside ML,' or 'Outside of ML,'. "
-                "Based only on what is listed above, state: what is this phenomenon called "
-                "outside ML, and which paper (arxiv ID) best explains it. Then propose 1 "
-                "specific experiment.\n\n"
+                "Based only on what is listed above, write two short sections:\n\n"
+                "**What we found:** (2-3 sentences) What do the most relevant papers show about this "
+                "phenomenon? If any outside-ML paper appears, name its field and what it found.\n\n"
+                "**Experiment:** (1-2 sentences) One specific experiment the researcher could run.\n\n"
                 "Tag every factual claim with [GROUNDED: arxiv:XXXX], [INFERRED], or [SPECULATIVE].\n"
                 "Ground every claim in the actual papers listed. Do not invent results."
             )
@@ -164,7 +231,7 @@ def _deterministic_directions_fallback(query: str, pairs: list, papers: dict) ->
             "Strongest connection:",
             f"ML paper: \"{pa.get('title', best.paper_a)}\" (arxiv:{best.paper_a})",
             f"Outside-ML paper: \"{pb.get('title', best.paper_b)}\" (arxiv:{best.paper_b}, {cat_b})",
-            f"LLM validation reasoning: {(best.reasoning_chain or '[none]')[:400]}",
+            f"LLM validation reasoning: {best.reasoning_chain or '[none]'}",
             "",
             "To generate full synthesis, ensure OpenRouter API is accessible.",
         ]
@@ -175,22 +242,226 @@ def _deterministic_directions_fallback(query: str, pairs: list, papers: dict) ->
 
 # ── bridge_report.md ──────────────────────────────────────────────────────────
 
+def _append_pair_entry(lines: list[str], pair: "BridgePair", papers: dict) -> None:
+    pa = papers.get(pair.paper_a, {})
+    pb = papers.get(pair.paper_b, {})
+    title_a = pa.get("title", pair.paper_a)
+    title_b = pb.get("title", pair.paper_b)
+    try:
+        cat_b_list = json.loads(pb.get("categories", "[]") or "[]")
+        cat_b_label = cat_b_list[0] if cat_b_list else "?"
+    except Exception:
+        cat_b_label = "?"
+    conn_label = _CONNECTION_LABELS.get(pair.classification, pair.classification)
+    reasoning = ""
+    if pair.reasoning_chain and pair.reasoning_chain != "[No reasoning captured]":
+        reasoning = pair.reasoning_chain.replace("\n", " ")
+    lines += [f"- **{title_b}** (arxiv:{pair.paper_b}, {cat_b_label})"]
+    lines.append(f"  {conn_label}.")
+    if reasoning:
+        lines.append(f"  {reasoning}")
+    lines += [f"  → Relates to: **{title_a}** (arxiv:{pair.paper_a})", ""]
+
+
+def _write_grouped_connections(lines: list[str], pairs: list["BridgePair"], papers: dict) -> None:
+    """Group pairs by outside-ML paper (paper_b); one block per unique framework."""
+    groups: dict[str, list["BridgePair"]] = {}
+    for pair in pairs:
+        groups.setdefault(pair.paper_b, []).append(pair)
+
+    for pid_b, group_pairs in groups.items():
+        pb = papers.get(pid_b, {})
+        title_b = pb.get("title", pid_b)
+        try:
+            cat_b_list = json.loads(pb.get("categories", "[]") or "[]")
+            cat_b_label = cat_b_list[0] if cat_b_list else "?"
+        except Exception:
+            cat_b_label = "?"
+
+        best = group_pairs[0]
+        conn_label = _CONNECTION_LABELS.get(best.classification, best.classification)
+
+        lines += [f"**{title_b}** (arxiv:{pid_b}, {cat_b_label})"]
+        lines.append(f"{conn_label}.")
+
+        reasoning = ""
+        if best.reasoning_chain and best.reasoning_chain != "[No reasoning captured]":
+            reasoning = best.reasoning_chain.replace("\n", " ")
+        if reasoning:
+            lines += [reasoning, ""]
+        else:
+            lines.append("")
+
+        n = len(group_pairs)
+        lines.append(f"Connects to {n} paper{'s' if n != 1 else ''} in your field:")
+        for pair in group_pairs:
+            pa = papers.get(pair.paper_a, {})
+            title_a = pa.get("title", pair.paper_a)
+            ml_reason = ""
+            if pair.reasoning_chain and pair.reasoning_chain != "[No reasoning captured]":
+                chain = pair.reasoning_chain.replace("\n", " ")
+                dot_idx = chain.find(". ")
+                ml_reason = chain[:dot_idx + 1] if dot_idx > 0 else chain[:300]
+            if ml_reason:
+                lines.append(f"- **{title_a}** (arxiv:{pair.paper_a}): {ml_reason}")
+            else:
+                lines.append(f"- **{title_a}** (arxiv:{pair.paper_a})")
+        lines.append("")
+
+
 def _write_bridge_report(
     out_dir: Path,
     query: str,
     result: BridgePipelineResult,
     papers: dict,
     top_clusters: list[BridgeCluster],
-) -> None:
+) -> Optional[str]:
+    qrs = result.query_relevance_scores or {}
+    direct_pairs = result.direct_cross_domain_pairs or []
+    all_validated = [p for c in top_clusters for p in c.validated_pairs]
+
+    # ── All non-NONE pairs, STRUCTURAL first ──────────────────────────────────
+    strong_pairs = sorted(
+        (p for p in direct_pairs if p.classification == "STRUCTURAL"),
+        key=lambda p: p.similarity, reverse=True,
+    )
+    related_pairs = sorted(
+        (p for p in direct_pairs if p.classification in ("METHODOLOGICAL", "THEMATIC")),
+        key=lambda p: p.similarity, reverse=True,
+    )
+
+    # Fix 2: each paper_b appears in exactly one section — strong wins
+    strong_paper_bs = {p.paper_b for p in strong_pairs}
+    extra = sorted(
+        [p for p in related_pairs if p.paper_b in strong_paper_bs],
+        key=lambda p: p.similarity, reverse=True,
+    )
+    strong_pairs = strong_pairs + extra
+    related_pairs = [p for p in related_pairs if p.paper_b not in strong_paper_bs]
+
+    # Fix 3: filter CS-subfield noise and surface-level vocabulary matches from related only
+    related_pairs = [
+        p for p in related_pairs
+        if not _is_cs_subfield_noise(p, papers)
+        and not _reasoning_is_surface_only(p)
+    ]
+
+    all_display_pairs = strong_pairs + related_pairs
+    combined_pairs = all_display_pairs if all_display_pairs else all_validated
+
+    # ── Build synthesis context ───────────────────────────────────────────────
+    top5 = sorted(qrs, key=qrs.__getitem__, reverse=True)[:5]
+    top_papers_lines: list[str] = []
+    for pid in top5:
+        p = papers.get(pid, {})
+        title = p.get("title", pid)
+        _abs = p.get("abstract") or ""
+        abstract = (_abs[:600] + "…") if len(_abs) > 600 else _abs
+        top_papers_lines.append(f"- {title} (arxiv:{pid}): {abstract}")
+    top_papers_text = "\n".join(top_papers_lines) if top_papers_lines else "No papers."
+
+    str_pids = [pid for pid, p in papers.items()
+                if (p.get("query_tag") or "").startswith("str")]
+    str_by_qrs = sorted(str_pids, key=lambda p: qrs.get(p, 0.0), reverse=True)[:5]
+    str_papers_lines: list[str] = []
+    for pid in str_by_qrs:
+        p = papers.get(pid, {})
+        title = p.get("title", pid)
+        _abs = p.get("abstract") or ""
+        abstract = (_abs[:600] + "…") if len(_abs) > 600 else _abs
+        try:
+            cats = json.loads(p.get("categories", "[]") or "[]")
+            cat = cats[0] if cats else "?"
+        except Exception:
+            cat = "?"
+        str_papers_lines.append(f"- {title} (arxiv:{pid}, {cat}): {abstract}")
+    str_papers_text = "\n".join(str_papers_lines)
+
+    if combined_pairs:
+        ctx_lines: list[str] = []
+        for pair in combined_pairs[:5]:
+            pa = papers.get(pair.paper_a, {})
+            pb = papers.get(pair.paper_b, {})
+            ta = pa.get("title", pair.paper_a)
+            tb = pb.get("title", pair.paper_b)
+            ctx_lines.append(
+                f"- {pair.classification}: arxiv:{pair.paper_a} ({ta}) "
+                f"↔ arxiv:{pair.paper_b} ({tb})"
+            )
+        bridge_pairs_text = "\n".join(ctx_lines)
+    else:
+        bridge_pairs_text = "None found."
+
+    # ── Run synthesis LLM first (result goes at top of report) ───────────────
+    directions = _gemma_research_directions(
+        query, top_papers_text, bridge_pairs_text,
+        direct_pairs=direct_pairs, papers=papers,
+        str_papers_text=str_papers_text,
+        structural_queries=result.structural_queries,
+        query_relevance_scores=result.query_relevance_scores,
+    )
+    n_grounded = len(re.findall(r'\[GROUNDED:', directions)) if directions else 0
+    n_inferred = len(re.findall(r'\[INFERRED\]', directions)) if directions else 0
+    n_speculative = len(re.findall(r'\[SPECULATIVE\]', directions)) if directions else 0
+
+    # ── Assemble report ───────────────────────────────────────────────────────
     lines: list[str] = [f"# Research Analysis: {query}", ""]
 
-    # ── Section 1: Top 8 papers by relevance score ────────────────────────────
-    lines += ["## Top Papers by Relevance", ""]
+    # Section 1: Synthesis at top
+    if directions:
+        lines += [directions, ""]
+    else:
+        lines += _deterministic_directions_fallback(query, combined_pairs, papers)
+        lines.append("")
 
-    qrs = result.query_relevance_scores or {}
+    # Section 2: Cross-Domain Connections
+    lines += ["## Cross-Domain Connections", ""]
+
+    if all_display_pairs:
+        if strong_pairs:
+            n_str_fw = len({p.paper_b for p in strong_pairs})
+            lines += [f"### Strong connections ({n_str_fw})", ""]
+            _write_grouped_connections(lines, strong_pairs, papers)
+        if related_pairs:
+            n_rel_fw = len({p.paper_b for p in related_pairs})
+            lines += [f"### Related connections ({n_rel_fw})", ""]
+            _write_grouped_connections(lines, related_pairs, papers)
+    elif all_validated:
+        lines.append("*Connections found via embedding similarity (no direct LLM validation):*\n")
+        for pair in all_validated:
+            _append_pair_entry(lines, pair, papers)
+    else:
+        str_cats: list[str] = []
+        for _p in papers.values():
+            if (_p.get("query_tag") or "").startswith("str"):
+                try:
+                    _cats = json.loads(_p.get("categories", "[]") or "[]")
+                    if _cats:
+                        str_cats.append(_cats[0])
+                except Exception:
+                    pass
+        str_cats = sorted(set(str_cats))
+        if str_cats:
+            lines += [
+                "No cross-domain connections were validated in this run.",
+                f"The structural channel retrieved papers from: {', '.join(str_cats)}.",
+                "Consider rephrasing the query to emphasize the mathematical or "
+                "mechanistic aspect of the phenomenon.",
+                "",
+            ]
+        else:
+            lines += [
+                "No cross-domain connections were validated in this run.",
+                "The structural channel found no papers. Consider rephrasing to "
+                "emphasize the mathematical or mechanistic aspect of the phenomenon.",
+                "",
+            ]
+
+    # Section 3: Papers Retrieved (de-cluttered — no relevance scores)
+    lines += ["## Papers Retrieved", ""]
+
     ranked = sorted(qrs, key=qrs.__getitem__, reverse=True)[:10]
     ranked = _dedupe_by_title_overlap(ranked, papers)[:8]
-
     if ranked:
         for pid in ranked:
             p = papers.get(pid, {})
@@ -202,189 +473,29 @@ def _write_bridge_report(
                 field = cats_list[0] if cats_list else "?"
             except json.JSONDecodeError:
                 field = "?"
-            score = qrs.get(pid, 0.0)
             abstract = p.get("abstract", "")
             first_sent = ""
             if abstract:
-                first_sent = abstract.split(". ")[0].strip()[:120]
-                if len(abstract.split(". ")[0]) > 120:
-                    first_sent += "…"
-
+                first_sent = abstract.split(". ")[0].strip()
+                if len(first_sent) > 600:
+                    first_sent = first_sent[:600] + "…"
             lines.append(f"- **{title}** (arxiv:{pid}, {year}, {field})")
-            desc = f"Relevance: {score:.3f}."
             if first_sent:
-                desc += f" {first_sent}."
-            lines.append(f"  {desc}")
+                lines.append(f"  {first_sent}.")
             lines.append("")
     else:
         lines += ["No papers with relevance scores found.", ""]
 
-    # ── Section 2: Validated bridge pairs ─────────────────────────────────────
-    lines += ["## Validated Bridge Connections", ""]
-
-    all_validated = [p for c in top_clusters for p in c.validated_pairs]
-    direct_pairs = result.direct_cross_domain_pairs or []
-    structural_direct = sorted(
-        (p for p in direct_pairs if p.classification == "STRUCTURAL"),
-        key=lambda p: p.similarity,
-        reverse=True,
-    )[:5]
-    has_structural = bool(structural_direct)
-
-    if not has_structural:
-        if all_validated:
-            lines.append("### Embedding-Based Validation\n")
-            for n, pair in enumerate(all_validated, start=1):
-                pa = papers.get(pair.paper_a, {})
-                pb = papers.get(pair.paper_b, {})
-                title_a = pa.get("title", pair.paper_a)
-                title_b = pb.get("title", pair.paper_b)
-                try:
-                    cat_a = json.loads(pa.get("categories", "[]") or "[]")
-                    cat_a_label = cat_a[0] if cat_a else "?"
-                except Exception:
-                    cat_a_label = "?"
-                try:
-                    cat_b = json.loads(pb.get("categories", "[]") or "[]")
-                    cat_b_label = cat_b[0] if cat_b else "?"
-                except Exception:
-                    cat_b_label = "?"
-                lines += [
-                    f"### Pair {n}: {pair.classification} · {pair.confidence_tier}",
-                    f"- **{title_a}** (arxiv:{pair.paper_a}, {cat_a_label})",
-                    f"- **{title_b}** (arxiv:{pair.paper_b}, {cat_b_label})",
-                ]
-                if pair.reasoning_chain and pair.reasoning_chain != "[No reasoning captured]":
-                    reasoning = pair.reasoning_chain[:400].replace("\n", " ")
-                    lines.append(f"- Reasoning: {reasoning}")
-                if pair.matched_properties:
-                    lines.append(f"- Shared properties: {', '.join(pair.matched_properties[:4])}")
-                lines.append("")
-        else:
-            if direct_pairs:
-                lines += [
-                    f"*Embedding similarity threshold: no cross-domain bridges above 0.72. "
-                    f"Direct LLM comparison found {len(direct_pairs)} connection(s) — shown below.*",
-                    "",
-                ]
-            else:
-                lines += [
-                    "No embedding-based cross-domain bridges were found for this query.",
-                    "",
-                    "Possible reasons:",
-                    "- All retrieved papers share the same top-level arXiv category.",
-                    "- Domain expansion via LLM may not have found papers from adjacent fields.",
-                    "- The similarity threshold (0.72) may be too strict for this topic.",
-                    "",
-                    f'Suggested next step: try `arxanon search "{query}" --max-results 200`,',
-                    "or rephrase to include terms from a different field.",
-                    "",
-                ]
-
-    display_direct = structural_direct if has_structural else direct_pairs
-    if display_direct:
-        lines += [
-            "### Direct LLM Comparison (embedding threshold bypassed)",
-            "",
-            "*The following pairs were validated by sending abstracts directly to the LLM,*",
-            "*without requiring embedding similarity. They represent connections where the*",
-            "*mathematical structure is shared but domain vocabulary diverges too far for*",
-            "*embedding-based similarity to detect.*",
-            "",
-        ]
-        for n, pair in enumerate(display_direct, start=1):
-            pa = papers.get(pair.paper_a, {})
-            pb = papers.get(pair.paper_b, {})
-            title_a = pa.get("title", pair.paper_a)
-            title_b = pb.get("title", pair.paper_b)
-            try:
-                cat_a = json.loads(pa.get("categories", "[]") or "[]")
-                cat_a_label = cat_a[0] if cat_a else "?"
-            except Exception:
-                cat_a_label = "?"
-            try:
-                cat_b = json.loads(pb.get("categories", "[]") or "[]")
-                cat_b_label = cat_b[0] if cat_b else "?"
-            except Exception:
-                cat_b_label = "?"
-            tag_a = pa.get("query_tag", "")
-            tag_b = pb.get("query_tag", "")
-            lines += [
-                f"### Direct Pair {n}: {pair.classification}",
-                f"- **{title_a}** (arxiv:{pair.paper_a}, {cat_a_label}, channel:{tag_a})",
-                f"- **{title_b}** (arxiv:{pair.paper_b}, {cat_b_label}, channel:{tag_b})",
-            ]
-            if pair.reasoning_chain:
-                reasoning = pair.reasoning_chain[:400].replace("\n", " ")
-                lines.append(f"- Reasoning: {reasoning}")
-            lines.append(f"- Validation: direct LLM comparison (relevance sum: {pair.similarity * 2:.3f})")
-            lines.append("")
-
-    # ── Section 3: Gemma research directions ──────────────────────────────────
-    lines += ["## Research Directions", ""]
-
-    # Build context for Gemma
-    top5 = sorted(qrs, key=qrs.__getitem__, reverse=True)[:5]
-    top_papers_lines: list[str] = []
-    for pid in top5:
-        p = papers.get(pid, {})
-        title = p.get("title", pid)
-        abstract = (p.get("abstract") or "")[:200]
-        top_papers_lines.append(f"- {title} (arxiv:{pid}): {abstract}")
-    top_papers_text = "\n".join(top_papers_lines) if top_papers_lines else "No papers."
-
-    str_pids = [pid for pid, p in papers.items()
-                if (p.get("query_tag") or "").startswith("str")]
-    str_by_qrs = sorted(str_pids, key=lambda p: qrs.get(p, 0.0), reverse=True)[:5]
-    str_papers_lines: list[str] = []
-    for pid in str_by_qrs:
-        p = papers.get(pid, {})
-        title = p.get("title", pid)
-        abstract = (p.get("abstract") or "")[:200]
-        try:
-            cats = json.loads(p.get("categories", "[]") or "[]")
-            cat = cats[0] if cats else "?"
-        except Exception:
-            cat = "?"
-        str_papers_lines.append(f"- {title} (arxiv:{pid}, {cat}): {abstract}")
-    str_papers_text = "\n".join(str_papers_lines)
-
-    combined_pairs = structural_direct if has_structural else all_validated
-    if combined_pairs:
-        bridge_lines: list[str] = []
-        for pair in combined_pairs[:5]:
-            pa = papers.get(pair.paper_a, {})
-            pb = papers.get(pair.paper_b, {})
-            ta = pa.get("title", pair.paper_a)
-            tb = pb.get("title", pair.paper_b)
-            bridge_lines.append(
-                f"- {pair.classification}: arxiv:{pair.paper_a} ({ta[:60]}) "
-                f"↔ arxiv:{pair.paper_b} ({tb[:60]})"
-            )
-        bridge_pairs_text = "\n".join(bridge_lines)
-    else:
-        bridge_pairs_text = "None found."
-
-    directions = _gemma_research_directions(
-        query, top_papers_text, bridge_pairs_text,
-        direct_pairs=direct_pairs, papers=papers,
-        str_papers_text=str_papers_text,
-    )
-    if directions:
-        n_grounded = len(re.findall(r'\[GROUNDED:', directions))
-        n_inferred = len(re.findall(r'\[INFERRED\]', directions))
-        n_speculative = len(re.findall(r'\[SPECULATIVE\]', directions))
+    # Footer: provenance (moved to end)
+    if directions and (n_grounded or n_inferred or n_speculative):
         provenance = (
             f"*Provenance: {n_grounded} claim(s) grounded in cited abstracts "
             f"| {n_inferred} inferred | {n_speculative} speculative*"
         )
-        lines += [provenance, ""]
-        lines.append(directions)
-    else:
-        lines += _deterministic_directions_fallback(query, combined_pairs, papers)
-    lines.append("")
+        lines += ["---", "", provenance, ""]
 
     (out_dir / "bridge_report.md").write_text("\n".join(lines), encoding="utf-8")
+    return directions
 
 
 # ── Deduplication ─────────────────────────────────────────────────────────────

@@ -509,6 +509,7 @@ def execute_pipeline(
         console.print("[bold]Stage 1:[/bold] Retrieving papers from arXiv\n")
 
     sem_queries = _gemma_expand_queries(query)
+    # structural queries are regenerated from scratch for each pipeline call — no cross-run state
     str_queries = _llm_structural_queries(query, sem_queries)
     structural_query_map: dict[str, str] = {
         f"str{i + 1}": q for i, q in enumerate(str_queries)
@@ -702,6 +703,7 @@ def execute_pipeline(
             query=query,
             query_vector=_query_vector,
         )
+        bridge_result.structural_queries = str_queries
 
     papers_embedded = load_papers_with_embeddings()
     if verbose:
@@ -918,7 +920,7 @@ def search(
         bridge_result, papers_embedded = result
         if bridge_result.clusters:
             from .output_writer import save_session
-            out_dir = save_session(query, bridge_result, papers_embedded)
+            out_dir, _ = save_session(query, bridge_result, papers_embedded)
             console.print(f"\n  [dim]Output saved to[/dim] [cyan]./{out_dir.name}/[/cyan]\n")
 
 

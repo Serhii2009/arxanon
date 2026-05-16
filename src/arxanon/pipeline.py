@@ -46,7 +46,11 @@ def _gemma_expand_queries(query: str) -> list[str]:
             "not static behavior of trained models\n"
             "- Good terms: 'during training', 'training dynamics', 'learning trajectory', "
             "'gradient dynamics', 'optimization trajectory', 'emergence during training'\n"
-            "- Avoid: applications, inference-time behavior, interpretability of trained models\n\n"
+            "- Avoid: applications, inference-time behavior, interpretability of trained models\n"
+            "- Generate queries that will find the most specific ML papers studying "
+            "this phenomenon during training or inference. Use technical ML vocabulary. "
+            "Target papers about training dynamics, emergence, or architectural behavior "
+            "— not general topic papers.\n\n"
             "Examples for \"why are LLMs black boxes\":\n"
             "  mechanistic interpretability transformer circuits\n"
             "  feature visualization language model neurons\n"
@@ -90,40 +94,55 @@ def _llm_structural_queries(query: str, semantic_queries: list[str]) -> list[str
         print("[DEBUG] Waiting for LLM structural query generation (up to 45s)...")
         sem_text = "\n".join(f"- {q}" for q in semantic_queries)
         prompt = (
-            "You are helping find cross-domain mathematical analogies in research.\n\n"
-            f"Research problem: {query}\n\n"
-            f"Semantic queries already sent to arXiv (researcher's own domain):\n{sem_text}\n\n"
-            "Task: Identify the underlying mathematical structure of this research problem — "
-            "the abstract equations, dynamical properties, or geometric features, "
-            "independent of the application domain. Then generate 3 arXiv search queries "
-            "that would find papers from COMPLETELY DIFFERENT scientific fields studying "
-            "the SAME mathematical structure with different vocabulary.\n\n"
-            "Target arXiv categories: math.DS, nlin.CD, physics.cond-mat, physics.data-an, "
-            "q-bio.QM, stat.ME — DO NOT target cs.* at all.\n\n"
-            "Use vocabulary natural to those domains. Examples:\n"
-            "  edge-of-stability (ML) → 'delayed bifurcation discrete dynamical systems' "
-            "or 'slow manifold unstable equilibrium passage'\n"
-            "  attention head collapse → 'phase transition symmetry breaking order parameter'\n"
-            "  loss landscape flatness → 'Lyapunov exponent zero eigenvalue center manifold'\n"
-            "  gradient noise → 'stochastic resonance Langevin equation noise-induced transition'\n\n"
-            "Generate queries ONLY using vocabulary from these fields:\n"
-            "- Numerical analysis and numerical methods (math.NA)\n"
-            "- Dynamical systems and bifurcation theory (math.DS)\n"
-            "- Control theory and optimal control (math.OC)\n"
-            "- Statistical physics and condensed matter (cond-mat.stat-mech)\n"
-            "- Stochastic processes and probability (math.PR)\n"
-            "- Nonlinear dynamics (nlin)\n\n"
-            "Do NOT generate queries using vocabulary from:\n"
-            "- Quantum computing or quantum information\n"
-            "- Quantum mechanics or quantum field theory\n"
-            "- Adiabatic quantum computation\n"
-            "Even if these fields use similar-sounding mathematical terms.\n\n"
-            "Reply with exactly 3 queries, one per line. "
-            "Each query is 4-6 words. No numbering. No labels. No explanation."
+            "A machine learning researcher has described the following phenomenon:\n\n"
+            f"{query}\n\n"
+            "Your task is to generate 3 arXiv search queries that will find papers "
+            "from fields OUTSIDE machine learning that formally study this phenomenon.\n\n"
+            "Step 1 — Identify which non-ML scientific field(s) most naturally "
+            "contain formal mathematical or empirical studies of this phenomenon.\n\n"
+            "Consider ALL of these fields and choose the most appropriate:\n"
+            "- Neuroscience and cognitive neuroscience (q-bio.NC)\n"
+            "- Cognitive psychology and learning theory (q-bio.NC, cs.HC)\n"
+            "- Information theory and statistical inference (cs.IT, math.IT)\n"
+            "- Control theory and systems engineering (math.OC, eess.SY)\n"
+            "- Statistical physics and complex systems (cond-mat.stat-mech)\n"
+            "- Nonlinear dynamics and chaos (nlin, math.DS)\n"
+            "- Evolutionary biology and population dynamics (q-bio.PE)\n"
+            "- Economics and game theory (econ, q-fin)\n"
+            "- Linguistics and formal language theory (non-ML cs.CL papers)\n"
+            "- Numerical analysis and scientific computing (math.NA)\n"
+            "- Probability theory and stochastic processes (math.PR)\n"
+            "- Epistemology and formal logic (math.LO)\n"
+            "- Sociology and network science (physics.soc-ph)\n\n"
+            "Step 2 — Generate exactly 3 search queries using the native "
+            "vocabulary of the field(s) you identified.\n\n"
+            "Rules:\n"
+            "- Each query must be 4-8 words\n"
+            "- Each query must use vocabulary that a researcher in that field "
+            "would use, NOT machine learning vocabulary\n"
+            "- Queries must target paper titles and abstracts from that field\n"
+            "- Do NOT default to dynamical systems unless the phenomenon "
+            "genuinely involves nonlinear dynamics or bifurcations\n"
+            "- Do NOT use quantum computing vocabulary\n"
+            "- The 3 queries may target 1 field or 3 different fields, "
+            "depending on what is most relevant to the phenomenon\n\n"
+            "Output ONLY the 3 queries, one per line, between --- markers:\n"
+            "---\n"
+            "[query 1]\n"
+            "[query 2]\n"
+            "[query 3]\n"
+            "---"
         )
         raw = call_llm(prompt, timeout=45, temperature=0.2)
         print(f"[DEBUG] Structural LLM raw response:\n---\n{raw}\n---")
-        lines = [re.sub(r"^\d+[\.\)]\s*", "", ln).strip() for ln in raw.splitlines()]
+        lines_raw = raw.splitlines()
+        try:
+            start = next(i for i, l in enumerate(lines_raw) if l.strip() == "---")
+            end   = next(i for i, l in enumerate(lines_raw) if i > start and l.strip() == "---")
+            lines_raw = lines_raw[start + 1 : end]
+        except StopIteration:
+            pass
+        lines = [re.sub(r"^\d+[\.\)]\s*", "", ln).strip() for ln in lines_raw]
         queries = [ln for ln in lines if len(ln.split()) >= 2]
         print(f"[DEBUG] Parsed {len(queries)} structural queries: {queries}")
         if 2 <= len(queries) <= 5:

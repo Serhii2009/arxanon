@@ -469,88 +469,112 @@ def _gemma_synthesis_panel(
     papers: dict,
     out_dir: Path,
     console: Console,
+    directions: Optional[str] = None,
 ) -> None:
     from .clusters import BridgePipelineResult
-    from .llm_client import call_llm
     assert isinstance(bridge_result, BridgePipelineResult)
 
-    # Top 5 papers by query relevance
-    qrs = bridge_result.query_relevance_scores or {}
-    qrs_missing = not qrs and bool(papers)
-    top_pids = sorted(qrs, key=qrs.__getitem__, reverse=True)[:5]
-    if not top_pids and papers:
-        str_pids = [pid for pid, p in papers.items() if (p.get("query_tag") or "").startswith("str")]
-        sem_pids = [pid for pid, p in papers.items() if (p.get("query_tag") or "").startswith("sem")]
-        top_pids = (str_pids[:3] + sem_pids[:2])[:5]
-    paper_lines: list[str] = []
-    for pid in top_pids:
-        p = papers.get(pid, {})
-        title = p.get("title", pid)
-        abstract = (p.get("abstract") or "")[:300]
-        try:
-            cats = json.loads(p.get("categories", "[]") or "[]")
-            cat = cats[0] if cats else "?"
-        except Exception:
-            cat = "?"
-        paper_lines.append(f"- {title} (arxiv:{pid}, {cat})\n  {abstract}")
-    papers_text = "\n".join(paper_lines) if paper_lines else "No papers retrieved."
+    direct_pairs_all = bridge_result.direct_cross_domain_pairs or []
+    strong_direct = [p for p in direct_pairs_all if p.classification == "STRUCTURAL"]
+    related_direct = [p for p in direct_pairs_all if p.classification in ("METHODOLOGICAL", "THEMATIC")]
+    all_direct = strong_direct + related_direct
 
-    # Bridge findings
-    all_validated = [p for c in bridge_result.clusters for p in c.validated_pairs]
-    structural_direct = [
-        p for p in (bridge_result.direct_cross_domain_pairs or [])
-        if p.classification == "STRUCTURAL"
-    ]
+    if directions is not None:
+        gemma_text = directions
+        llm_failed = False
+        qrs_missing = False
+    else:
+        from .llm_client import call_llm
 
-    if all_validated or structural_direct:
-        best_pairs = structural_direct[:3] if structural_direct else all_validated[:3]
-        bridge_lines: list[str] = []
-        for pair in best_pairs:
-            pa = papers.get(pair.paper_a, {})
-            pb = papers.get(pair.paper_b, {})
-            ta = pa.get("title", pair.paper_a)
-            tb = pb.get("title", pair.paper_b)
+        qrs = bridge_result.query_relevance_scores or {}
+        qrs_missing = not qrs and bool(papers)
+        top_pids = sorted(qrs, key=qrs.__getitem__, reverse=True)[:5]
+        if not top_pids and papers:
+            str_pids = [pid for pid, p in papers.items() if (p.get("query_tag") or "").startswith("str")]
+            sem_pids = [pid for pid, p in papers.items() if (p.get("query_tag") or "").startswith("sem")]
+            top_pids = (str_pids[:3] + sem_pids[:2])[:5]
+        paper_lines: list[str] = []
+        for pid in top_pids:
+            p = papers.get(pid, {})
+            title = p.get("title", pid)
+            abstract = (p.get("abstract") or "")[:300]
             try:
-                cats = json.loads(pb.get("categories", "[]") or "[]")
-                cat_b = cats[0] if cats else "?"
+                cats = json.loads(p.get("categories", "[]") or "[]")
+                cat = cats[0] if cats else "?"
             except Exception:
-                cat_b = "?"
-            bridge_lines.append(
-                f"- {pair.classification}: arxiv:{pair.paper_a} ({ta[:60]})"
-                f" ↔ arxiv:{pair.paper_b} ({tb[:60]}, {cat_b})"
-            )
-            if pair.reasoning_chain and pair.reasoning_chain != "[No reasoning captured]":
-                bridge_lines.append(f"  Reasoning: {pair.reasoning_chain[:200]}")
-        bridge_text = "\n".join(bridge_lines)
+                cat = "?"
+            paper_lines.append(f"- {title} (arxiv:{pid}, {cat})\n  {abstract}")
+        papers_text = "\n".join(paper_lines) if paper_lines else "No papers retrieved."
 
-        if structural_direct:
-            best = structural_direct[0]
-            pa = papers.get(best.paper_a, {})
-            pb = papers.get(best.paper_b, {})
-            try:
-                cats = json.loads(pb.get("categories", "[]") or "[]")
-                cat_b = cats[0] if cats else "?"
-            except Exception:
-                cat_b = "?"
-            prompt = (
-                f'Researcher asked: "{query}"\n\n'
-                f"Strongest cross-domain connection found:\n"
-                f"ML paper: \"{pa.get('title', best.paper_a)}\" (arxiv:{best.paper_a})\n"
-                f"  Abstract: {(pa.get('abstract') or '')[:300]}\n"
-                f"Math/physics paper: \"{pb.get('title', best.paper_b)}\""
-                f" (arxiv:{best.paper_b}, {cat_b})\n"
-                f"  Abstract: {(pb.get('abstract') or '')[:300]}\n"
-                f"Structural correspondence: {best.reasoning_chain[:300]}\n\n"
-                f"Supporting papers by relevance:\n{papers_text}\n\n"
-                "Your response MUST begin with 'Outside ML,' or 'Outside of ML,' — this is mandatory.\n"
-                "Answer in exactly two paragraphs:\n"
-                "Paragraph 1: What the phenomenon is called outside ML, the field, and the specific "
-                "paper (arxiv ID). Start: 'Outside ML, this is known as [name] in [field] "
-                "(arxiv:[non-CS ID]).'\n"
-                "Paragraph 2: What that paper says about the mechanism, in 2-3 sentences. "
-                "Do NOT mention cosmological phase transitions or any unrelated field."
+        all_validated = [p for c in bridge_result.clusters for p in c.validated_pairs]
+
+        if all_validated or all_direct:
+            best_pairs = all_direct[:3] if all_direct else all_validated[:3]
+            bridge_lines: list[str] = []
+            for pair in best_pairs:
+                pa = papers.get(pair.paper_a, {})
+                pb = papers.get(pair.paper_b, {})
+                ta = pa.get("title", pair.paper_a)
+                tb = pb.get("title", pair.paper_b)
+                try:
+                    cats = json.loads(pb.get("categories", "[]") or "[]")
+                    cat_b = cats[0] if cats else "?"
+                except Exception:
+                    cat_b = "?"
+                bridge_lines.append(
+                    f"- {pair.classification}: arxiv:{pair.paper_a} ({ta})"
+                    f" ↔ arxiv:{pair.paper_b} ({tb}, {cat_b})"
+                )
+                if pair.reasoning_chain and pair.reasoning_chain != "[No reasoning captured]":
+                    bridge_lines.append(f"  Reasoning: {pair.reasoning_chain[:200]}")
+            bridge_text = "\n".join(bridge_lines)
+
+            if all_direct:
+                best = all_direct[0]
+                pa = papers.get(best.paper_a, {})
+                pb = papers.get(best.paper_b, {})
+                try:
+                    cats = json.loads(pb.get("categories", "[]") or "[]")
+                    cat_b = cats[0] if cats else "?"
+                except Exception:
+                    cat_b = "?"
+                prompt = (
+                    f'Researcher asked: "{query}"\n\n'
+                    f"Strongest cross-domain connection found:\n"
+                    f"ML paper: \"{pa.get('title', best.paper_a)}\" (arxiv:{best.paper_a})\n"
+                    f"  Abstract: {(pa.get('abstract') or '')[:300]}\n"
+                    f"Outside-ML paper: \"{pb.get('title', best.paper_b)}\""
+                    f" (arxiv:{best.paper_b}, {cat_b})\n"
+                    f"  Abstract: {(pb.get('abstract') or '')[:300]}\n"
+                    f"Connection: {best.reasoning_chain[:300]}\n\n"
+                    f"Supporting papers:\n{papers_text}\n\n"
+                    "Write exactly two short paragraphs:\n"
+                    "Paragraph 1 (2 sentences): What this outside-ML paper says about the phenomenon "
+                    "and why it matters to the researcher's question. Start with the field and paper.\n"
+                    "Paragraph 2 (1-2 sentences): One specific experiment the researcher could run next week.\n"
+                    "No labels, no jargon. Plain English."
+                )
+            else:
+                prompt = (
+                    f'You are analyzing papers found for this research query: "{query}"\n\n'
+                    f"Top papers by relevance:\n{papers_text}\n\n"
+                    f"Bridge detector findings:\n{bridge_text}\n\n"
+                    "Your response MUST begin with 'Outside ML,' or 'Outside of ML,' if any "
+                    "cross-domain connection is found. Answer exactly these three questions in "
+                    "plain language, grounded only in what was actually found above. "
+                    "Do not invent papers, results, or claims.\n\n"
+                    "1. What do the most interesting papers show?\n"
+                    "2. Is there any unexpected cross-domain connection in the findings?\n"
+                    "3. What is one concrete, mathematically specific next step a researcher could pursue?\n\n"
+                    "Keep each answer to 2-3 sentences. No labels or headers — just three paragraphs."
+                )
+        elif bridge_result.clusters:
+            best = bridge_result.clusters[0]
+            cats_str = " ↔ ".join(best.categories[:3]) if best.categories else "?"
+            bridge_text = (
+                f"Bridge clusters found ({cats_str}) but Gemma validation produced no confirmed pairs. "
+                "Connections are based on embedding similarity only."
             )
-        else:
             prompt = (
                 f'You are analyzing papers found for this research query: "{query}"\n\n'
                 f"Top papers by relevance:\n{papers_text}\n\n"
@@ -564,74 +588,54 @@ def _gemma_synthesis_panel(
                 "3. What is one concrete, mathematically specific next step a researcher could pursue?\n\n"
                 "Keep each answer to 2-3 sentences. No labels or headers — just three paragraphs."
             )
-    elif bridge_result.clusters:
-        best = bridge_result.clusters[0]
-        cats_str = " ↔ ".join(best.categories[:3]) if best.categories else "?"
-        bridge_text = (
-            f"Bridge clusters found ({cats_str}) but Gemma validation produced no confirmed pairs. "
-            "Connections are based on embedding similarity only."
-        )
-        prompt = (
-            f'You are analyzing papers found for this research query: "{query}"\n\n'
-            f"Top papers by relevance:\n{papers_text}\n\n"
-            f"Bridge detector findings:\n{bridge_text}\n\n"
-            "Your response MUST begin with 'Outside ML,' or 'Outside of ML,' if any "
-            "cross-domain connection is found. Answer exactly these three questions in "
-            "plain language, grounded only in what was actually found above. "
-            "Do not invent papers, results, or claims.\n\n"
-            "1. What do the most interesting papers show?\n"
-            "2. Is there any unexpected cross-domain connection in the findings?\n"
-            "3. What is one concrete, mathematically specific next step a researcher could pursue?\n\n"
-            "Keep each answer to 2-3 sentences. No labels or headers — just three paragraphs."
-        )
-    else:
-        bridge_text = "No cross-domain bridges found — all papers appear to be from the same domain."
-        prompt = (
-            f'You are analyzing papers found for this research query: "{query}"\n\n'
-            f"Top papers by relevance:\n{papers_text}\n\n"
-            f"Bridge detector findings:\n{bridge_text}\n\n"
-            "Your response MUST begin with 'Outside ML,' or 'Outside of ML,' if any "
-            "cross-domain connection is found. Answer exactly these three questions in "
-            "plain language, grounded only in what was actually found above. "
-            "Do not invent papers, results, or claims.\n\n"
-            "1. What do the most interesting papers show?\n"
-            "2. Is there any unexpected cross-domain connection in the findings?\n"
-            "3. What is one concrete, mathematically specific next step a researcher could pursue?\n\n"
-            "Keep each answer to 2-3 sentences. No labels or headers — just three paragraphs."
-        )
-
-    llm_failed = False
-    gemma_text = ""
-    try:
-        gemma_text = call_llm(prompt, timeout=30, temperature=0.3)
-    except Exception:
-        llm_failed = True
-
-    if not gemma_text:
-        _best = structural_direct[0] if structural_direct else (all_validated[0] if all_validated else None)
-        if _best is not None:
-            _pa = papers.get(_best.paper_a, {})
-            _pb = papers.get(_best.paper_b, {})
-            try:
-                _cats_b = json.loads(_pb.get("categories", "[]") or "[]")
-                _cat_b = _cats_b[0] if _cats_b else "?"
-            except Exception:
-                _cat_b = "?"
-            _n = len(structural_direct) if structural_direct else len(all_validated)
-            _ta = _pa.get("title", _best.paper_a)
-            _tb = _pb.get("title", _best.paper_b)
-            _chain = (_best.reasoning_chain or "[none]")[:250]
-            gemma_text = (
-                f"✓ {_n} cross-domain structural connection(s) found.\n"
-                "[Synthesis unavailable — network issue]\n\n"
-                "Strongest connection:\n"
-                f"{_tb} (arxiv:{_best.paper_b}, {_cat_b})\n"
-                f"↔ {_ta} (arxiv:{_best.paper_a})\n\n"
-                f"Structural correspondence: {_chain}\n\n"
-                "Open bridge_report.md for full analysis."
-            )
         else:
-            gemma_text = "[No cross-domain connections found. Full analysis in bridge_report.md.]"
+            bridge_text = "No cross-domain bridges found — all papers appear to be from the same domain."
+            prompt = (
+                f'You are analyzing papers found for this research query: "{query}"\n\n'
+                f"Top papers by relevance:\n{papers_text}\n\n"
+                f"Bridge detector findings:\n{bridge_text}\n\n"
+                "Your response MUST begin with 'Outside ML,' or 'Outside of ML,' if any "
+                "cross-domain connection is found. Answer exactly these three questions in "
+                "plain language, grounded only in what was actually found above. "
+                "Do not invent papers, results, or claims.\n\n"
+                "1. What do the most interesting papers show?\n"
+                "2. Is there any unexpected cross-domain connection in the findings?\n"
+                "3. What is one concrete, mathematically specific next step a researcher could pursue?\n\n"
+                "Keep each answer to 2-3 sentences. No labels or headers — just three paragraphs."
+            )
+
+        llm_failed = False
+        gemma_text = ""
+        try:
+            gemma_text = call_llm(prompt, timeout=30, temperature=0.3)
+        except Exception:
+            llm_failed = True
+
+        if not gemma_text:
+            _best = all_direct[0] if all_direct else (all_validated[0] if all_validated else None)
+            if _best is not None:
+                _pa = papers.get(_best.paper_a, {})
+                _pb = papers.get(_best.paper_b, {})
+                try:
+                    _cats_b = json.loads(_pb.get("categories", "[]") or "[]")
+                    _cat_b = _cats_b[0] if _cats_b else "?"
+                except Exception:
+                    _cat_b = "?"
+                _n = len(all_direct) if all_direct else len(all_validated)
+                _ta = _pa.get("title", _best.paper_a)
+                _tb = _pb.get("title", _best.paper_b)
+                _chain = (_best.reasoning_chain or "[none]")[:250]
+                gemma_text = (
+                    f"✓ {_n} cross-domain structural connection(s) found.\n"
+                    "[Synthesis unavailable — network issue]\n\n"
+                    "Strongest connection:\n"
+                    f"{_tb} (arxiv:{_best.paper_b}, {_cat_b})\n"
+                    f"↔ {_ta} (arxiv:{_best.paper_a})\n\n"
+                    f"Structural correspondence: {_chain}\n\n"
+                    "Open bridge_report.md for full analysis."
+                )
+            else:
+                gemma_text = "[No cross-domain connections found. Full analysis in bridge_report.md.]"
 
     prefix_parts: list[str] = []
     if qrs_missing:
@@ -639,10 +643,16 @@ def _gemma_synthesis_panel(
             "Query relevance scoring unavailable (memory constraint). "
             "Showing cross-domain bridges found via structural analysis."
         )
-    if structural_direct and not llm_failed:
+    if bridge_result.structural_queries:
+        sq_preview = " | ".join(bridge_result.structural_queries[:3])
+        prefix_parts.append(f"Searched outside ML using: {sq_preview}")
+    n_strong = len(strong_direct)
+    n_related = len(related_direct)
+    if (n_strong or n_related) and not llm_failed:
+        n_frameworks = len({p.paper_b for p in all_direct})
+        n_total = len(all_direct)
         prefix_parts.append(
-            f"✓ {len(structural_direct)} cross-domain structural connection(s) found"
-            " via direct LLM comparison."
+            f"✓ {n_frameworks} outside-ML framework(s) found across {n_total} connection(s)."
         )
     if gemma_text and prefix_parts:
         gemma_text = "\n\n".join(prefix_parts) + "\n\n" + gemma_text
@@ -688,8 +698,8 @@ def _run_search(query: str, console: Console, settings: dict) -> None:
 
     if result:
         bridge_result, papers = result
-        out_dir = save_session(query, bridge_result, papers)
-        _gemma_synthesis_panel(query, bridge_result, papers, out_dir, console)
+        out_dir, directions = save_session(query, bridge_result, papers)
+        _gemma_synthesis_panel(query, bridge_result, papers, out_dir, console, directions=directions)
 
 
 def _print_session_header(console: Console, settings: dict) -> None:
