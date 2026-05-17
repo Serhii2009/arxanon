@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import faiss
@@ -34,6 +35,12 @@ class Embedder:
 
     def _load(self) -> None:
         from sentence_transformers import SentenceTransformer
+
+        os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+        logging.getLogger("transformers").setLevel(logging.ERROR)
+        logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 
         logger.info("Loading embedding model: %s", self.model_name)
         self._model = SentenceTransformer(self.model_name, trust_remote_code=True)

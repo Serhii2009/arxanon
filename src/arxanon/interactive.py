@@ -3,11 +3,19 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Optional
 
+import questionary
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.document import Document
+from prompt_toolkit.formatted_text import FormattedText
+from prompt_toolkit.styles import Style as PromptStyle
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 
 from . import __version__, config
@@ -31,6 +39,43 @@ _BOUNDS: dict[str, tuple[int, int]] = {
     "top_clusters": (1, 10),
     "coupling_threshold": (1, 20),
 }
+
+_SLASH_COMMANDS = [
+    ("/help",     "Show all available commands"),
+    ("/clear",    "Clear the screen and reprint the session header"),
+    ("/history",  "Show previous queries this session"),
+    ("/save",     "Save the last report files to a named location"),
+    ("/rerun",    "Re-run the most recent query"),
+    ("/settings", "Open the settings interface"),
+    ("/fields",   "Show which scientific fields were reached in the last run"),
+    ("/pairs",    "Show all validated connections from the last run"),
+    ("/quit",     "Exit Arxanon"),
+]
+
+
+class _SlashCompleter(Completer):
+    def get_completions(self, document: Document, complete_event):
+        text = document.text_before_cursor
+        if not text.startswith("/"):
+            return
+        word = text.lower()
+        for cmd, desc in _SLASH_COMMANDS:
+            if cmd.startswith(word):
+                yield Completion(cmd, start_position=-len(text), display_meta=desc)
+
+
+_PROMPT_STYLE = PromptStyle.from_dict({
+    "completion-menu.completion.current": "bg:ansipurple fg:ansiwhite bold",
+    "completion-menu.completion":         "bg:ansibrightblack fg:ansiwhite",
+})
+
+_PROMPT_MSG = FormattedText([("", "\n"), ("bold fg:ansicyan", "  Research problem > ")])
+
+_Q_STYLE = questionary.Style([
+    ("selected",    "fg:purple bold"),
+    ("pointer",     "fg:purple bold"),
+    ("highlighted", "fg:purple bold"),
+])
 
 
 # ── Settings persistence ──────────────────────────────────────────────────────
@@ -193,149 +238,172 @@ def _list_ollama_models() -> list[str]:
 
 # ── /settings handler ─────────────────────────────────────────────────────────
 
+def _settings_openrouter(console: Console, working: dict) -> bool:
+    model_choice = questionary.select(
+        "Choose Gemma 4 model:",
+        choices=[
+            "google/gemma-4-31b-it    (best quality)",
+            "google/gemma-4-9b-it     (faster)",
+            "Enter custom model ID",
+            "← Back",
+        ],
+        style=_Q_STYLE,
+    ).ask()
+
+    if model_choice is None or model_choice == "← Back":
+        return False
+
+    if model_choice == "Enter custom model ID":
+        custom = questionary.text("Model ID:").ask()
+        if not custom:
+            return False
+        working["gemma_model"] = custom.strip()
+    elif "31b" in model_choice:
+        working["gemma_model"] = "google/gemma-4-31b-it"
+    else:
+        working["gemma_model"] = "google/gemma-4-9b-it"
+
+    raw_key = questionary.password(
+        "OpenRouter API key (press Enter to keep existing key):"
+    ).ask()
+    if raw_key is None:
+        return False
+    if raw_key:
+        working["openrouter_api_key"] = raw_key
+
+    return True
+
+
+def _settings_ollama(console: Console, working: dict) -> bool:
+    try:
+        import requests
+        resp = requests.get(f"{config.OLLAMA_BASE_URL}/api/tags", timeout=3)
+        resp.raise_for_status()
+        available = [m.get("name", "") for m in resp.json().get("models", [])]
+    except Exception:
+        console.print(
+            f"  [yellow]Could not connect to Ollama at {config.OLLAMA_BASE_URL}.\n"
+            "  Make sure Ollama is running and try again.[/yellow]"
+        )
+        return False
+
+    ollama_choices = available + ["Enter custom model name", "← Back"]
+    model_choice = questionary.select(
+        "Choose local model:",
+        choices=ollama_choices,
+        style=_Q_STYLE,
+    ).ask()
+
+    if model_choice is None or model_choice == "← Back":
+        return False
+
+    if model_choice == "Enter custom model name":
+        custom = questionary.text("Model name:").ask()
+        if not custom:
+            return False
+        working["gemma_model"] = custom.strip()
+    else:
+        working["gemma_model"] = model_choice
+
+    url = questionary.text(
+        "Ollama server URL:",
+        default=config.OLLAMA_BASE_URL,
+    ).ask()
+    if url is None:
+        return False
+    config.OLLAMA_BASE_URL = url.strip()
+
+    working["openrouter_api_key"] = ""
+    return True
+
+
+def _settings_llm(console: Console, working: dict) -> bool:
+    provider = questionary.select(
+        "Choose provider:",
+        choices=[
+            "OpenRouter  (cloud, requires API key)",
+            "Ollama      (local, free, requires Ollama running)",
+            "← Back",
+        ],
+        style=_Q_STYLE,
+    ).ask()
+
+    if provider is None or provider == "← Back":
+        return False
+    if provider.startswith("OpenRouter"):
+        return _settings_openrouter(console, working)
+    return _settings_ollama(console, working)
+
+
 def _handle_settings(console: Console, settings: dict) -> dict:
     embed_label = settings["embed_model"].split("/")[-1]
-    if settings.get("openrouter_api_key"):
-        provider_label = f"OpenRouter · {settings['gemma_model']}"
-    else:
-        provider_label = f"Ollama · {settings['gemma_model']}"
+    provider_label = (
+        f"OpenRouter · {settings['gemma_model']}"
+        if settings.get("openrouter_api_key") else
+        f"Ollama · {settings['gemma_model']}"
+    )
     console.print(
         f"\n  [bold]Current settings[/bold]\n"
-        f"  [dim]1[/dim]  Embedding model:    [cyan]{embed_label}[/cyan]\n"
-        f"  [dim]2[/dim]  LLM provider/model: [cyan]{provider_label}[/cyan]\n"
-        f"  [dim]3[/dim]  max_results:        [cyan]{settings['max_results']}[/cyan]"
+        f"  Embedding model:    [cyan]{embed_label}[/cyan]\n"
+        f"  LLM provider/model: [cyan]{provider_label}[/cyan]\n"
+        f"  max_results:        [cyan]{settings['max_results']}[/cyan]"
         f"  [dim](papers fetched per query)[/dim]\n"
-        f"  [dim]4[/dim]  max_validate:       [cyan]{settings['max_validate']}[/cyan]"
+        f"  max_validate:       [cyan]{settings['max_validate']}[/cyan]"
         f"  [dim](bridge pairs sent to Gemma)[/dim]\n"
-        f"  [dim]5[/dim]  top_clusters:       [cyan]{settings['top_clusters']}[/cyan]"
+        f"  top_clusters:       [cyan]{settings['top_clusters']}[/cyan]"
         f"  [dim](clusters shown in output)[/dim]\n"
-        f"  [dim]6[/dim]  coupling_threshold: [cyan]{settings['coupling_threshold']}[/cyan]"
+        f"  coupling_threshold: [cyan]{settings['coupling_threshold']}[/cyan]"
         f"  [dim](bibcoupling filter)[/dim]\n"
     )
-    console.print("  Enter a number to change it, or press Enter to cancel.\n")
 
-    try:
-        choice = console.input("  Setting to change [1–6]: ").strip()
-    except (EOFError, KeyboardInterrupt):
+    working = dict(settings)
+
+    choice = questionary.select(
+        "What would you like to change?",
+        choices=[
+            "LLM provider and model",
+            f"Results per query (currently: {working['max_results']})",
+            f"Pairs to validate (currently: {working['max_validate']})",
+            "Done",
+        ],
+        style=_Q_STYLE,
+    ).ask()
+
+    if choice is None or choice == "Done":
         return settings
 
-    if choice == "1":
-        console.print("\n  [cyan]1[/cyan] BAAI/bge-large-en-v1.5   [cyan]2[/cyan] nvidia/NV-Embed-v2")
-        try:
-            c = console.input(f"  Choice (current: {embed_label}): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            c = ""
-        if c == "1":
-            settings["embed_model"] = "BAAI/bge-large-en-v1.5"
-        elif c == "2":
-            settings["embed_model"] = "nvidia/NV-Embed-v2"
-
-    elif choice == "2":
-        console.print("\n  [bold]LLM provider[/bold]")
-        console.print("  [cyan]1[/cyan]  Ollama  [dim](local, free)[/dim]")
-        console.print("  [cyan]2[/cyan]  OpenRouter  [dim](cloud, requires API key)[/dim]")
-        try:
-            provider_choice = console.input("\n  Provider [1]: ").strip() or "1"
-        except (EOFError, KeyboardInterrupt):
-            provider_choice = ""
-
-        if provider_choice == "2":
-            try:
-                raw_key = console.input("  OpenRouter API key: ", password=True).strip()
-            except (EOFError, KeyboardInterrupt):
-                raw_key = ""
-            if raw_key:
-                settings["openrouter_api_key"] = raw_key
-                os.environ["OPENROUTER_API_KEY"] = raw_key
-                config.OPENROUTER_API_KEY = raw_key
-                config.USE_OPENROUTER = True
-
-            or_models = [
-                "google/gemma-2-27b-it",
-                "google/gemma-3-27b-it",
-                "google/gemma-2-9b-it",
-            ]
-            console.print("\n  [bold]OpenRouter model[/bold]")
-            for i, m in enumerate(or_models, 1):
-                console.print(f"  [cyan]{i}[/cyan]  {m}")
-            console.print("  [cyan]c[/cyan]  Enter custom model ID")
-            try:
-                mc = console.input(f"\n  Choice (current: {settings['gemma_model']}): ").strip()
-            except (EOFError, KeyboardInterrupt):
-                mc = ""
-            if mc == "c":
-                try:
-                    custom = console.input("  Model ID: ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    custom = ""
-                if custom:
-                    settings["gemma_model"] = custom
-            elif mc.isdigit():
-                idx = int(mc) - 1
-                if 0 <= idx < len(or_models):
-                    settings["gemma_model"] = or_models[idx]
-
-        elif provider_choice == "1":
-            settings["openrouter_api_key"] = ""
-            os.environ.pop("OPENROUTER_API_KEY", None)
-            config.OPENROUTER_API_KEY = ""
-            config.USE_OPENROUTER = False
-
-            available = _list_ollama_models()
-            if available:
-                console.print("\n  [bold]Ollama models[/bold]")
-                for i, name in enumerate(available, 1):
-                    console.print(f"  [cyan]{i}[/cyan]  {name}")
-                console.print("  [cyan]c[/cyan]  Enter custom model name")
-                try:
-                    mc = console.input(f"\n  Choice (current: {settings['gemma_model']}): ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    mc = ""
-                if mc == "c":
-                    try:
-                        custom = console.input("  Model name: ").strip()
-                    except (EOFError, KeyboardInterrupt):
-                        custom = ""
-                    if custom:
-                        settings["gemma_model"] = custom
-                elif mc.isdigit():
-                    idx = int(mc) - 1
-                    if 0 <= idx < len(available):
-                        settings["gemma_model"] = available[idx]
-            else:
-                console.print(f"\n  [yellow]No Ollama models found.[/yellow]")
-                console.print(f"  [dim]Run: ollama serve && ollama pull {settings['gemma_model']}[/dim]")
-                try:
-                    custom = console.input(f"  Model name (current: {settings['gemma_model']}): ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    custom = ""
-                if custom:
-                    settings["gemma_model"] = custom
-
-    elif choice == "3":
-        settings["max_results"] = _prompt_int(
-            console, "max_results", settings["max_results"], *_BOUNDS["max_results"]
+    changed = False
+    if choice == "LLM provider and model":
+        changed = _settings_llm(console, working)
+    elif choice.startswith("Results per query"):
+        working["max_results"] = _prompt_int(
+            console, "max_results", working["max_results"], *_BOUNDS["max_results"]
         )
-    elif choice == "4":
-        settings["max_validate"] = _prompt_int(
-            console, "max_validate", settings["max_validate"], *_BOUNDS["max_validate"]
+        changed = True
+    elif choice.startswith("Pairs to validate"):
+        working["max_validate"] = _prompt_int(
+            console, "max_validate", working["max_validate"], *_BOUNDS["max_validate"]
         )
-    elif choice == "5":
-        settings["top_clusters"] = _prompt_int(
-            console, "top_clusters", settings["top_clusters"], *_BOUNDS["top_clusters"]
-        )
-    elif choice == "6":
-        settings["coupling_threshold"] = _prompt_int(
-            console, "coupling_threshold", settings["coupling_threshold"], *_BOUNDS["coupling_threshold"]
-        )
+        changed = True
 
-    save_settings(settings)
-    os.environ["ARXANON_EMBED_MODEL"] = settings["embed_model"]
-    os.environ["ARXANON_GEMMA_MODEL"] = settings["gemma_model"]
-    config.EMBED_MODEL = settings["embed_model"]
-    config.GEMMA_MODEL = settings["gemma_model"]
-    console.print(f"\n  [green]✓[/green] Settings updated.\n")
-    return settings
+    if not changed:
+        return settings
+
+    save_settings(working)
+    os.environ["ARXANON_EMBED_MODEL"] = working["embed_model"]
+    os.environ["ARXANON_GEMMA_MODEL"] = working["gemma_model"]
+    config.EMBED_MODEL = working["embed_model"]
+    config.GEMMA_MODEL = working["gemma_model"]
+    if working.get("openrouter_api_key"):
+        os.environ["OPENROUTER_API_KEY"] = working["openrouter_api_key"]
+        config.OPENROUTER_API_KEY = working["openrouter_api_key"]
+        config.USE_OPENROUTER = True
+    else:
+        os.environ.pop("OPENROUTER_API_KEY", None)
+        config.OPENROUTER_API_KEY = ""
+        config.USE_OPENROUTER = False
+    console.print("\n  [green]✓[/green] Settings updated.\n")
+    return working
 
 
 # ── Interactive session ───────────────────────────────────────────────────────
@@ -364,27 +432,60 @@ def run_interactive_session() -> None:
     from .db import init_db
     init_db()
 
+    _query_history: list[str] = []
+    _last: list = [None]  # _last[0] = (bridge_result, papers, out_dir) | None
+
+    def _run_and_store(q: str) -> None:
+        r = _run_search(q, console, settings)
+        if r is not None:
+            _query_history.append(q)
+            _last[0] = r
+
+    _session = PromptSession(
+        completer=_SlashCompleter(),
+        style=_PROMPT_STYLE,
+        complete_while_typing=True,
+    )
+
     while True:
         try:
-            raw = console.input("\n[bold cyan]  Research problem >[/bold cyan] ").strip()
+            raw = _session.prompt(_PROMPT_MSG).strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\n\n  [dim]Goodbye.[/dim]")
             break
 
         if not raw:
             continue
-        if raw.lower() in ("/quit", "/exit", "/q"):
+
+        low = raw.lower()
+        if low in ("/quit", "/exit", "/q"):
             console.print("\n  [dim]Goodbye.[/dim]")
             break
-        if raw.lower() == "/help":
-            _print_help(console)
-            continue
-        if raw.lower() == "/settings":
+        elif low == "/help":
+            _cmd_help(console)
+        elif low == "/clear":
+            _cmd_clear(console, settings)
+        elif low == "/history":
+            _cmd_history(console, _query_history, _run_and_store)
+        elif low == "/rerun":
+            if _query_history:
+                console.print(f"\n  Re-running: [italic]{_query_history[-1]}[/italic]\n")
+                r = _run_search(_query_history[-1], console, settings)
+                if r is not None:
+                    _last[0] = r
+            else:
+                console.print("  [yellow]No previous query.[/yellow]")
+        elif low == "/save" or low.startswith("/save "):
+            _cmd_save(console, _last[0], raw[5:].strip() or None)
+        elif low == "/fields":
+            _cmd_fields(console, _last[0])
+        elif low == "/pairs":
+            _cmd_pairs(console, _last[0])
+        elif low == "/settings":
             settings = _handle_settings(console, settings)
             _print_session_header(console, settings)
-            continue
-
-        _run_search(raw, console, settings)
+        else:
+            _run_and_store(raw)
 
 
 def _print_result_panel(
@@ -632,10 +733,10 @@ def _gemma_synthesis_panel(
                     f"{_tb} (arxiv:{_best.paper_b}, {_cat_b})\n"
                     f"↔ {_ta} (arxiv:{_best.paper_a})\n\n"
                     f"Structural correspondence: {_chain}\n\n"
-                    "Open bridge_report.md for full analysis."
+                    "Open cross_domain_report.md for full analysis."
                 )
             else:
-                gemma_text = "[No cross-domain connections found. Full analysis in bridge_report.md.]"
+                gemma_text = "[No cross-domain connections found. Full analysis in cross_domain_report.md.]"
 
     prefix_parts: list[str] = []
     if qrs_missing:
@@ -667,7 +768,7 @@ def _gemma_synthesis_panel(
     )
 
 
-def _run_search(query: str, console: Console, settings: dict) -> None:
+def _run_search(query: str, console: Console, settings: dict) -> tuple | None:
     from .cli import execute_pipeline
     from .output_writer import save_session
 
@@ -694,12 +795,14 @@ def _run_search(query: str, console: Console, settings: dict) -> None:
         )
     except Exception as exc:
         console.print(f"\n  [red]Pipeline error:[/red] {exc}\n  Try again or check your connection.")
-        return
+        return None
 
     if result:
         bridge_result, papers = result
         out_dir, directions = save_session(query, bridge_result, papers)
         _gemma_synthesis_panel(query, bridge_result, papers, out_dir, console, directions=directions)
+        return bridge_result, papers, out_dir
+    return None
 
 
 def _print_session_header(console: Console, settings: dict) -> None:
@@ -725,15 +828,148 @@ def _print_session_header(console: Console, settings: dict) -> None:
     )
 
 
-def _print_help(console: Console) -> None:
-    console.print(
-        Panel(
-            "  /help      Show this message\n"
-            "  /settings  View and change any of the 6 settings\n"
-            "  /quit      Exit the session\n\n"
-            "  [dim]Or just type your research problem and press Enter.[/dim]",
-            title="[bold]Commands[/bold]",
-            border_style="dim",
-            padding=(0, 2),
-        )
-    )
+_FIELD_NAMES: dict[str, str] = {
+    "math.DS": "Dynamical Systems",
+    "cond-mat.stat-mech": "Statistical Physics",
+    "nlin": "Nonlinear Dynamics",
+    "nlin.CD": "Nonlinear Dynamics",
+    "physics": "Physics",
+    "physics.soc-ph": "Social Physics",
+    "q-bio": "Quantitative Biology",
+    "q-bio.NC": "Computational Neuroscience",
+    "math": "Mathematics",
+    "math.NA": "Numerical Analysis",
+    "math.PR": "Probability Theory",
+    "cs": "Computer Science",
+    "cs.LG": "Machine Learning",
+    "cs.AI": "Artificial Intelligence",
+    "econ": "Economics",
+    "eess": "Electrical Engineering",
+    "stat": "Statistics",
+    "cond-mat": "Condensed Matter",
+}
+
+
+def _cmd_help(console: Console) -> None:
+    table = Table(title="Slash Commands", border_style="dim", show_header=True)
+    table.add_column("Command", style="cyan", no_wrap=True)
+    table.add_column("Description")
+    table.add_row("/help",          "Show this message")
+    table.add_row("/settings",      "Change LLM, embedding model, or pipeline parameters")
+    table.add_row("/history",       "List past queries; re-run by number")
+    table.add_row("/save [file]",   "Copy output files to a named location")
+    table.add_row("/rerun",         "Re-run the most recent query")
+    table.add_row("/fields",        "Show which arXiv categories were retrieved")
+    table.add_row("/pairs",         "Show validated cross-domain pairs")
+    table.add_row("/clear",         "Clear the screen and reprint session header")
+    table.add_row("/quit",          "Exit")
+    console.print(table)
+    console.print("  [dim]Or just type your research problem and press Enter.[/dim]\n")
+
+
+def _cmd_clear(console: Console, settings: dict) -> None:
+    console.clear()
+    _print_session_header(console, settings)
+
+
+def _cmd_history(
+    console: Console,
+    history: list[str],
+    run_fn: object,
+) -> None:
+    if not history:
+        console.print("  [yellow]No queries yet.[/yellow]")
+        return
+    console.print()
+    for i, q in enumerate(history, 1):
+        console.print(f"  [cyan]{i}[/cyan]  {q}")
+    try:
+        choice = console.input("\n  Re-run query # (Enter to skip): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if choice.isdigit():
+        idx = int(choice) - 1
+        if 0 <= idx < len(history):
+            run_fn(history[idx])  # type: ignore[operator]
+
+
+def _cmd_save(console: Console, last_result: tuple | None, dest: str | None) -> None:
+    if last_result is None:
+        console.print("  [yellow]No results yet — run a query first.[/yellow]")
+        return
+    _, _, out_dir = last_result
+    if not dest:
+        try:
+            dest = console.input("  Save to directory: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+    if not dest:
+        return
+    dest_path = Path(dest)
+    dest_path.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for fname in ("cross_domain_report.md", "references.md", "connection_map.html"):
+        src = out_dir / fname  # type: ignore[operator]
+        if src.exists():
+            shutil.copy2(src, dest_path / fname)
+            copied += 1
+    console.print(f"  [green]✓[/green] {copied} file(s) saved to [cyan]{dest}[/cyan]")
+
+
+def _cmd_fields(console: Console, last_result: tuple | None) -> None:
+    if last_result is None:
+        console.print("  [yellow]No results yet — run a query first.[/yellow]")
+        return
+    _, papers, _ = last_result
+    cat_info: dict[str, dict] = {}
+    for p in papers.values():
+        try:
+            cats = json.loads(p.get("categories", "[]") or "[]")
+            tag = p.get("query_tag", "") or ""
+            channel = "structural" if tag.startswith("str") else "semantic"
+        except Exception:
+            continue
+        if cats:
+            cat = cats[0]
+            if cat not in cat_info:
+                cat_info[cat] = {"count": 0, "channel": channel}
+            cat_info[cat]["count"] += 1
+
+    table = Table(title="arXiv Fields Retrieved", border_style="dim")
+    table.add_column("Category", style="cyan")
+    table.add_column("Field Name")
+    table.add_column("Papers", justify="right", style="green")
+    table.add_column("Channel", style="dim")
+    for cat, info in sorted(cat_info.items(), key=lambda x: -x[1]["count"]):
+        prefix = cat.split(".")[0]
+        name = _FIELD_NAMES.get(cat) or _FIELD_NAMES.get(prefix) or cat
+        table.add_row(cat, name, str(info["count"]), info["channel"])
+    console.print(table)
+
+
+def _cmd_pairs(console: Console, last_result: tuple | None) -> None:
+    if last_result is None:
+        console.print("  [yellow]No results yet — run a query first.[/yellow]")
+        return
+    bridge_result, papers, _ = last_result
+    pairs = getattr(bridge_result, "direct_cross_domain_pairs", None) or []
+    if not pairs:
+        console.print("  [yellow]No validated cross-domain pairs in last run.[/yellow]")
+        return
+    table = Table(title="Cross-Domain Pairs", border_style="dim")
+    table.add_column("Type", style="green", no_wrap=True)
+    table.add_column("Outside-ML Paper")
+    table.add_column("Field", style="cyan", no_wrap=True)
+    table.add_column("Reason")
+    for pair in pairs:
+        pb = papers.get(pair.paper_b, {})
+        title = (pb.get("title") or pair.paper_b)[:60]
+        try:
+            cats = json.loads(pb.get("categories", "[]") or "[]")
+            cat = cats[0] if cats else "?"
+        except Exception:
+            cat = "?"
+        chain = (pair.reasoning_chain or "").replace("\n", " ")
+        reason = chain.split(". ")[0][:80] if chain else "—"
+        table.add_row(pair.classification, title, cat, reason)
+    console.print(table)

@@ -9,6 +9,8 @@ from typing import Optional
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+import logging
+
 import click
 from rich.console import Console
 from rich.panel import Panel
@@ -496,6 +498,7 @@ def execute_pipeline(
     no_tda: bool,
     coupling_threshold: int,
     verbose: bool = True,
+    debug: bool = False,
 ) -> Optional[tuple[BridgePipelineResult, dict]]:
     """Run the full pipeline (phases 1–3) with Rich display.
 
@@ -504,13 +507,33 @@ def execute_pipeline(
     Uses the module-level console for all output.
     When verbose=False, suppresses all info panels; progress bars remain.
     """
-    # ── Phase 1, Stage 1: Fetch papers ────────────────────────────────────────
-    if verbose:
-        console.print("[bold]Stage 1:[/bold] Retrieving papers from arXiv\n")
+    # ── Logging configuration ─────────────────────────────────────────────────
+    if not debug:
+        for _log_name in ("arxanon.pipeline", "arxanon.arxiv_client", "arxanon.semantic_scholar"):
+            logging.getLogger(_log_name).setLevel(logging.WARNING)
+        logging.getLogger("transformers").setLevel(logging.ERROR)
+    else:
+        logging.basicConfig(level=logging.DEBUG)
 
-    sem_queries = _gemma_expand_queries(query)
+    # ── Phase 1, Stage 1: Fetch papers ────────────────────────────────────────
+    console.print()
+    console.print("Generating search queries…")
+
+    with console.status("[cyan]Gemma is identifying relevant ML papers…[/cyan]"):
+        sem_queries = _gemma_expand_queries(query)
+    console.print(
+        "  [green]✓[/green] ML queries     "
+        + "[bold dim]" + " | ".join(f'"{q}"' for q in sem_queries) + "[/bold dim]"
+    )
+
     # structural queries are regenerated from scratch for each pipeline call — no cross-run state
-    str_queries = _llm_structural_queries(query, sem_queries)
+    with console.status("[cyan]Translating to physics and math vocabulary…[/cyan]"):
+        str_queries = _llm_structural_queries(query, sem_queries)
+    if str_queries:
+        console.print(
+            "  [green]✓[/green] Physics vocab  "
+            + "[bold dim]" + " | ".join(f'"{q}"' for q in str_queries) + "[/bold dim]"
+        )
     structural_query_map: dict[str, str] = {
         f"str{i + 1}": q for i, q in enumerate(str_queries)
     }
@@ -529,6 +552,9 @@ def execute_pipeline(
     total_fetched = 0
     sem_fetched = 0
     str_fetched = 0
+
+    console.print()
+    console.print("Fetching papers from arXiv…")
 
     with Progress(
         SpinnerColumn(),
@@ -580,41 +606,58 @@ def execute_pipeline(
             description=f"[green]✓[/green] {total_fetched} papers fetched ({sem_str}{str_str})",
         )
 
+    console.print()
+
     n_cats = get_unique_category_count()
     n_queries = len(sem_queries) + len(str_queries)
     if verbose:
         _retrieval_panel(total_fetched, n_queries, n_cats, sem_fetched, str_fetched)
 
     # ── Phase 1, Stage 2: Citation graph ──────────────────────────────────────
-    if verbose:
-        console.print("[bold]Stage 2:[/bold] Building citation graph via Semantic Scholar\n")
+    console.print()
+    console.print("Building citation network…")
 
     from .db import get_all_arxiv_ids
 
     all_ids = get_all_arxiv_ids()
 
+    _rate_limited: list[bool] = []
+
+    class _RLHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if "rate" in record.getMessage().lower():
+                _rate_limited.append(True)
+
+    _rl_handler = _RLHandler()
+    logging.getLogger("arxanon.semantic_scholar").addHandler(_rl_handler)
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
         console=console,
         transient=False,
     ) as progress:
-        task_c = progress.add_task("[cyan]Fetching citation data...[/cyan]", total=len(all_ids))
-        fetch_and_store_citations(
-            all_ids,
-            on_paper=lambda done, total: progress.update(task_c, completed=done, total=total),
-        )
+        task_c = progress.add_task("[cyan]Building citation graph…[/cyan]", total=len(all_ids))
+
+        def _on_citation(done: int, total: int) -> None:
+            desc = "Building citation graph…"
+            if _rate_limited:
+                desc += " [yellow][rate limited, retrying][/yellow]"
+            progress.update(task_c, completed=done, total=total, description=desc)
+
+        fetch_and_store_citations(all_ids, on_paper=_on_citation)
         progress.update(task_c, description="[green]✓[/green] Citation graph complete")
+
+    logging.getLogger("arxanon.semantic_scholar").removeHandler(_rl_handler)
+    console.print()
 
     edge_counts = get_citation_edge_count()
     if verbose:
         _citation_panel(edge_counts.get("direct", 0), edge_counts.get("cocitation", 0))
 
     # ── Phase 1, Stage 3: Embeddings ──────────────────────────────────────────
-    if verbose:
-        console.print("[bold]Stage 3:[/bold] Generating embeddings\n")
+    console.print()
+    console.print("Computing embeddings…")
 
     with Progress(
         SpinnerColumn(),
@@ -630,6 +673,8 @@ def execute_pipeline(
             task_e, description=f"[green]✓[/green] {index_size} vectors indexed"
         )
 
+    console.print()
+
     if verbose:
         _embedding_panel(index_size, config.EMBED_MODEL)
 
@@ -637,8 +682,7 @@ def execute_pipeline(
         return None
 
     # ── Phase 2: Bridge detection ─────────────────────────────────────────────
-    if verbose:
-        console.print("[bold]Stage 5:[/bold] Detecting citation-isolated bridge clusters\n")
+    console.print()
 
     from .bridge_pipeline import (
         run_bridge_pipeline,
@@ -704,6 +748,7 @@ def execute_pipeline(
             query_vector=_query_vector,
         )
         bridge_result.structural_queries = str_queries
+        bridge_result.semantic_queries = sem_queries
 
     papers_embedded = load_papers_with_embeddings()
     if verbose:
@@ -711,8 +756,8 @@ def execute_pipeline(
 
     # ── Phase 3: Gemma validation ─────────────────────────────────────────────
     if not no_gemma:
-        if verbose:
-            console.print("[bold]Stage 6:[/bold] Gemma 4 structural analogy verification\n")
+        console.print()
+        console.print("Validating cross-domain pairs with Gemma…")
 
         _bridge_edges_total = sum(
             len(c.bridge_edges) for c in bridge_result.clusters[:top_clusters]
@@ -752,15 +797,14 @@ def execute_pipeline(
             else:
                 progress.update(task_g, description="[yellow]~[/yellow] Ollama unavailable")
 
+        console.print()
+
         if verbose:
             _gemma_validation_panel(bridge_result)
 
     # ── Phase 3b: Direct cross-domain validation (bypasses similarity threshold) ─
     if not no_gemma:
-        if verbose:
-            console.print(
-                "[bold]Stage 6b:[/bold] Direct LLM comparison for cross-domain pairs\n"
-            )
+        console.print()
 
         with Progress(
             SpinnerColumn(),
@@ -876,6 +920,12 @@ def execute_pipeline(
     default=False,
     help="Delete the papers DB and FAISS index before running (start from scratch).",
 )
+@click.option(
+    "--debug",
+    is_flag=True,
+    default=False,
+    help="Show debug output for LLM and fetch steps.",
+)
 def search(
     query: str,
     max_results: int,
@@ -885,6 +935,7 @@ def search(
     top_clusters: int,
     max_validate: Optional[int],
     fresh: bool,
+    debug: bool,
 ) -> None:
     """Search for cross-domain structural analogies to QUERY.
 
@@ -914,6 +965,7 @@ def search(
         no_gemma=no_gemma,
         no_tda=no_tda,
         coupling_threshold=coupling_threshold,
+        debug=debug,
     )
 
     if result:

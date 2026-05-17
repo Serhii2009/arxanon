@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import time
 from typing import Callable, Optional
@@ -6,6 +7,8 @@ from typing import Callable, Optional
 import arxiv
 
 from .db import upsert_paper
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_id(entry_id: str) -> str:
@@ -37,7 +40,7 @@ def fetch_and_store_papers(
     Returns:
         Number of papers stored.
     """
-    print(f"[DEBUG] arXiv query [{query_tag}]: {query!r}")
+    logger.debug("arXiv query [%s]: %r", query_tag, query)
     client = arxiv.Client(
         page_size=min(100, max_results),
         delay_seconds=3.0,
@@ -72,9 +75,9 @@ def fetch_and_store_papers(
             status = getattr(exc, "status", None) or getattr(exc, "code", None)
             is_rate_limit = status == 429 or "429" in str(exc) or "rate" in str(exc).lower()
             if is_rate_limit and attempt == 0:
-                print(f"[WARN] arXiv rate limit ({exc}); waiting 60 s before retry…")
+                logger.warning("arXiv rate limit (%s); waiting 60 s before retry…", exc)
                 time.sleep(60)
             else:
-                print(f"[WARN] arXiv query [{query_tag}] failed: {exc}; using {count} papers collected so far")
+                logger.warning("arXiv query [%s] failed: %s; using %d papers collected so far", query_tag, exc, count)
                 break
     return count

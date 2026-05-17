@@ -30,10 +30,10 @@ def _gemma_expand_queries(query: str) -> list[str]:
 
     Falls back to [query] (single query) if the LLM is unavailable or response is unparseable.
     """
-    print(f"[DEBUG] _gemma_expand_queries called with: {query!r}")
+    logger.debug("_gemma_expand_queries called with: %r", query)
     try:
         from .llm_client import call_llm
-        print("[DEBUG] Waiting for LLM query expansion (up to 45s)...")
+        logger.debug("Waiting for LLM query expansion (up to 45s)...")
         prompt = (
             "You are helping search arXiv for papers about a research problem. "
             "Generate 3 specific arXiv search queries that will find the most relevant papers.\n\n"
@@ -64,17 +64,17 @@ def _gemma_expand_queries(query: str) -> list[str]:
             "No numbering. No labels. No explanation."
         )
         raw = call_llm(prompt, timeout=45, temperature=0.2)
-        print(f"[DEBUG] LLM raw response:\n---\n{raw}\n---")
+        logger.debug("LLM raw response:\n---\n%s\n---", raw)
         lines = [re.sub(r"^\d+[\.\)]\s*", "", ln).strip() for ln in raw.splitlines()]
         queries = [ln for ln in lines if len(ln.split()) >= 2]
-        print(f"[DEBUG] Parsed {len(queries)} queries: {queries}")
+        logger.debug("Parsed %d queries: %s", len(queries), queries)
         if 2 <= len(queries) <= 5:
-            print(f"[DEBUG] Using LLM-expanded queries: {queries[:4]}")
+            logger.debug("Using LLM-expanded queries: %s", queries[:4])
             return queries[:4]
-        print(f"[DEBUG] Query count {len(queries)} outside [2,5] — falling back")
+        logger.debug("Query count %d outside [2,5] — falling back", len(queries))
     except Exception as exc:
-        print(f"[DEBUG] LLM unavailable or failed: {exc!r} — using fallback")
-    print(f"[DEBUG] Fallback: single query [{query!r}]")
+        logger.debug("LLM unavailable or failed: %r — using fallback", exc)
+    logger.debug("Fallback: single query [%r]", query)
     return [query]
 
 
@@ -88,10 +88,10 @@ def _llm_structural_queries(query: str, semantic_queries: list[str]) -> list[str
 
     Returns up to 3 queries, or [] if the LLM fails.
     """
-    print(f"[DEBUG] _llm_structural_queries called for: {query!r}")
+    logger.debug("_llm_structural_queries called for: %r", query)
     try:
         from .llm_client import call_llm
-        print("[DEBUG] Waiting for LLM structural query generation (up to 45s)...")
+        logger.debug("Waiting for LLM structural query generation (up to 45s)...")
         sem_text = "\n".join(f"- {q}" for q in semantic_queries)
         prompt = (
             "A machine learning researcher has described the following phenomenon:\n\n"
@@ -134,7 +134,7 @@ def _llm_structural_queries(query: str, semantic_queries: list[str]) -> list[str
             "---"
         )
         raw = call_llm(prompt, timeout=45, temperature=0.2)
-        print(f"[DEBUG] Structural LLM raw response:\n---\n{raw}\n---")
+        logger.debug("Structural LLM raw response:\n---\n%s\n---", raw)
         lines_raw = raw.splitlines()
         try:
             start = next(i for i, l in enumerate(lines_raw) if l.strip() == "---")
@@ -144,13 +144,13 @@ def _llm_structural_queries(query: str, semantic_queries: list[str]) -> list[str
             pass
         lines = [re.sub(r"^\d+[\.\)]\s*", "", ln).strip() for ln in lines_raw]
         queries = [ln for ln in lines if len(ln.split()) >= 2]
-        print(f"[DEBUG] Parsed {len(queries)} structural queries: {queries}")
+        logger.debug("Parsed %d structural queries: %s", len(queries), queries)
         if 2 <= len(queries) <= 5:
-            print(f"[DEBUG] Using structural queries: {queries[:3]}")
+            logger.debug("Using structural queries: %s", queries[:3])
             return queries[:3]
-        print(f"[DEBUG] Structural query count {len(queries)} outside [2,5] — returning empty")
+        logger.debug("Structural query count %d outside [2,5] — returning empty", len(queries))
     except Exception as exc:
-        print(f"[DEBUG] Structural LLM failed: {exc!r}")
+        logger.debug("Structural LLM failed: %r", exc)
     return []
 
 

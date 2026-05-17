@@ -33,6 +33,27 @@ _FIELD_DISTANCE_FROM_CS: dict[str, int] = {
 
 _CS_NOISE_SUBCATS = {"cs.HC", "cs.RO", "cs.CR", "cs.MA"}
 
+_FIELD_NAMES: dict[str, str] = {
+    "math.DS": "Dynamical Systems",
+    "cond-mat.stat-mech": "Statistical Physics",
+    "nlin": "Nonlinear Dynamics",
+    "nlin.CD": "Nonlinear Dynamics",
+    "physics": "Physics",
+    "physics.soc-ph": "Social Physics",
+    "q-bio": "Quantitative Biology",
+    "q-bio.NC": "Computational Neuroscience",
+    "math": "Mathematics",
+    "math.NA": "Numerical Analysis",
+    "math.PR": "Probability Theory",
+    "cs": "Computer Science",
+    "cs.LG": "Machine Learning",
+    "cs.AI": "Artificial Intelligence",
+    "econ": "Economics",
+    "eess": "Electrical Engineering",
+    "stat": "Statistics",
+    "cond-mat": "Condensed Matter",
+}
+
 
 def _is_cs_subfield_noise(pair: "BridgePair", papers: dict) -> bool:
     pb = papers.get(pair.paper_b, {})
@@ -75,7 +96,8 @@ def save_session(
     papers: dict[str, dict],
 ) -> tuple[Path, Optional[str]]:
     """Save all output files to ./{query_slug}/. Returns (directory path, synthesis text)."""
-    slug = _query_slug(query)
+    first_ml = (bridge_result.semantic_queries or [""])[0]
+    slug = _query_slug(first_ml) if first_ml.strip() else _query_slug(query)
     out_dir = Path(slug)
     if out_dir.exists():
         i = 2
@@ -87,8 +109,8 @@ def save_session(
     top_clusters = bridge_result.clusters[:5]
 
     directions = _write_bridge_report(out_dir, query, bridge_result, papers, top_clusters)
-    _write_sources_bib(out_dir, top_clusters, papers)
     _write_bridge_map(out_dir, top_clusters, papers, bridge_result.direct_cross_domain_pairs or [])
+    _write_references_md(out_dir, bridge_result.direct_cross_domain_pairs or [], papers)
 
     return out_dir, directions
 
@@ -180,7 +202,12 @@ def _gemma_research_directions(
                 "  [SPECULATIVE] — goes beyond the papers\n\n"
                 "Hard constraint: never use [GROUNDED: arxiv:X] for a claim not directly in "
                 "the abstract text above. When uncertain, use [INFERRED].\n"
-                "Ground every claim in the actual papers listed. Do not invent results."
+                "Ground every claim in the actual papers listed. Do not invent results.\n\n"
+                "IMPORTANT: Each CONNECTION entry must explain what THIS SPECIFIC outside-ML paper "
+                "contributes beyond the general concept — its unique result, construction method, or "
+                "mathematical insight. Do not repeat the phrase describing the general geometric/dynamic "
+                "phenomenon more than once across the full response. Each connection must give a "
+                "researcher a distinct reason to read that specific paper."
             )
         else:
             str_section = (
@@ -494,7 +521,7 @@ def _write_bridge_report(
         )
         lines += ["---", "", provenance, ""]
 
-    (out_dir / "bridge_report.md").write_text("\n".join(lines), encoding="utf-8")
+    (out_dir / "cross_domain_report.md").write_text("\n".join(lines), encoding="utf-8")
     return directions
 
 
@@ -528,66 +555,21 @@ def _dedupe_by_title_overlap(paper_ids: list[str], papers: dict) -> list[str]:
     return kept
 
 
-# ── sources.bib ───────────────────────────────────────────────────────────────
-
-def _write_sources_bib(
-    out_dir: Path,
-    top_clusters: list[BridgeCluster],
-    papers: dict,
-) -> None:
-    seen: set[str] = set()
-    entries: list[str] = []
-
-    paper_ids = [pid for c in top_clusters for pid in c.paper_ids]
-    for arxiv_id in paper_ids:
-        if arxiv_id in seen:
-            continue
-        seen.add(arxiv_id)
-        p = papers.get(arxiv_id, {})
-        if not p:
-            continue
-
-        title = p.get("title", "").replace("{", "\\{").replace("}", "\\}").replace("&", "\\&")
-        date = p.get("date", "")
-        year = date[:4] if date else "?"
-
-        authors_raw = p.get("authors", "[]")
-        try:
-            author_list: list[str] = json.loads(authors_raw)
-        except Exception:
-            author_list = []
-        author_str = " and ".join(author_list) if author_list else "Unknown"
-
-        key = arxiv_id.replace("/", "_").replace(".", "_")
-        entry = (
-            f"@misc{{{key},\n"
-            f"  author       = {{{author_str}}},\n"
-            f"  title        = {{{{{title}}}}},\n"
-            f"  year         = {{{year}}},\n"
-            f"  howpublished = {{\\url{{https://arxiv.org/abs/{arxiv_id}}}}},\n"
-            f"  note         = {{arXiv:{arxiv_id}}}\n"
-            f"}}"
-        )
-        entries.append(entry)
-
-    (out_dir / "sources.bib").write_text("\n\n".join(entries) + "\n", encoding="utf-8")
-
-
-# ── bridge_map.html ───────────────────────────────────────────────────────────
+# ── connection_map.html ───────────────────────────────────────────────────────
 
 _BRIDGE_MAP_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>arxanon — bridge map</title>
+<title>arxanon — connection map</title>
 <style>
 body { margin: 0; background: #0f1117; color: #ccc; font-family: monospace; overflow: hidden; }
 svg { width: 100vw; height: 100vh; }
-.link { stroke-opacity: 0.5; }
+.link { stroke-opacity: 0.15; }
 #tooltip {
   position: absolute; background: #1e2030; border: 1px solid #444;
   padding: 8px 12px; border-radius: 4px; pointer-events: none;
-  font-size: 12px; max-width: 320px; line-height: 1.5; display: none;
+  font-size: 12px; max-width: 480px; line-height: 1.5; display: none;
 }
 #legend {
   position: absolute; top: 16px; right: 16px; background: rgba(30,32,48,0.92);
@@ -633,8 +615,8 @@ const g = svg.append("g");
 svg.call(d3.zoom().scaleExtent([0.15, 5]).on("zoom", e => g.attr("transform", e.transform)));
 
 const sim = d3.forceSimulation(graph.nodes)
-  .force("link", d3.forceLink(graph.links).id(d => d.id).distance(90).strength(0.25))
-  .force("charge", d3.forceManyBody().strength(-220))
+  .force("link", d3.forceLink(graph.links).id(d => d.id).distance(140).strength(0.25))
+  .force("charge", d3.forceManyBody().strength(-400))
   .force("center", d3.forceCenter(W / 2, H / 2))
   .force("collision", d3.forceCollide(18));
 
@@ -642,7 +624,15 @@ const link = g.append("g").selectAll("line")
   .data(graph.links).join("line")
   .attr("class", "link")
   .style("stroke", linkColor)
-  .style("stroke-width", d => 1 + d.similarity * 2.5);
+  .style("stroke-opacity", d => {
+    if (d.classification === "STRUCTURAL") return 0.7;
+    if (d.classification === "METHODOLOGICAL" || d.classification === "THEMATIC") return 0.5;
+    return 0.15;
+  })
+  .style("stroke-width", d => {
+    if (d.classification === "STRUCTURAL") return 2 + d.similarity * 3;
+    return 1 + d.similarity * 2.5;
+  });
 
 const node = g.append("g").selectAll("g")
   .data(graph.nodes).join("g")
@@ -650,6 +640,9 @@ const node = g.append("g").selectAll("g")
     .on("start", (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; })
     .on("drag",  (e, d) => { d.fx=e.x; d.fy=e.y; })
     .on("end",   (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx=null; d.fy=null; }));
+
+node.style("cursor", "pointer")
+    .on("click", (e, d) => window.open(`https://arxiv.org/abs/${d.id}`, "_blank"));
 
 node.append("circle")
   .attr("r", d => 5 + (d.bridge_count||0)*2)
@@ -659,23 +652,176 @@ node.append("circle")
 
 const tip = d3.select("#tooltip");
 node.on("mouseover", (e, d) => {
-  tip.style("display","block").style("left",(e.pageX+14)+"px").style("top",(e.pageY-10)+"px")
-     .html(`<strong style="color:#eee">${d.title}</strong><br>`
-         + `<span style="color:#888">${d.id}</span><br>`
+  const connected = new Set([d.id]);
+  graph.links.forEach(l => {
+    const sid = l.source.id !== undefined ? l.source.id : l.source;
+    const tid = l.target.id !== undefined ? l.target.id : l.target;
+    if (sid === d.id) connected.add(tid);
+    if (tid === d.id) connected.add(sid);
+  });
+  node.style("opacity", n => connected.has(n.id) ? 1 : 0.08);
+  link.style("stroke-opacity", l => {
+    const sid = l.source.id !== undefined ? l.source.id : l.source;
+    const tid = l.target.id !== undefined ? l.target.id : l.target;
+    return (sid === d.id || tid === d.id) ? 0.9 : 0.04;
+  });
+  tip.style("display","block")
+     .style("left",(e.pageX+14)+"px")
+     .style("top",(e.pageY-10)+"px")
+     .html(`<strong style="color:#eee">${d.full_title}</strong><br>`
+         + `<span style="color:#888">arxiv:${d.id}</span><br>`
          + `<span style="color:${nodeColor(d)}">${d.category}</span>`
          + (d.classification ? ` · <span style="color:${CLS_COLORS[d.classification]||'#888'}">${d.classification}</span>` : ""));
 }).on("mousemove", e => {
   tip.style("left",(e.pageX+14)+"px").style("top",(e.pageY-10)+"px");
-}).on("mouseout", () => tip.style("display","none"));
+}).on("mouseout", () => {
+  node.style("opacity", 1);
+  link.style("stroke-opacity", l => l.classification ? 0.65 : 0.15);
+  tip.style("display","none");
+});
 
 sim.on("tick", () => {
+  const PAD = 20;
   link.attr("x1",d=>d.source.x).attr("y1",d=>d.source.y)
       .attr("x2",d=>d.target.x).attr("y2",d=>d.target.y);
-  node.attr("transform",d=>`translate(${d.x},${d.y})`);
+  node.attr("transform", d => {
+    d.x = Math.max(PAD, Math.min(W - PAD, d.x));
+    d.y = Math.max(PAD, Math.min(H - PAD, d.y));
+    return `translate(${d.x},${d.y})`;
+  });
 });
 </script>
 </body>
 </html>"""
+
+
+def _unique_paper_summaries(direct_pairs: list, papers: dict) -> dict[str, str]:
+    """One batch LLM call → unique one-sentence summary per outside-ML paper.
+
+    Returns dict mapping paper_b arxiv_id → summary. Falls back to {} on any error.
+    """
+    try:
+        from .llm_client import call_llm
+
+        seen: dict[str, object] = {}
+        for pair in direct_pairs:
+            if pair.paper_b not in seen:
+                seen[pair.paper_b] = pair
+
+        if not seen:
+            return {}
+
+        paper_lines: list[str] = []
+        for arxiv_id, pair in seen.items():
+            pb = papers.get(arxiv_id, {})
+            title = pb.get("title", arxiv_id)
+            abstract = (pb.get("abstract") or "")[:400]
+            reasoning = (pair.reasoning_chain or "")[:300]  # type: ignore[attr-defined]
+            paper_lines.append(
+                f"PAPER {arxiv_id}: {title}\n"
+                f"Abstract: {abstract}\n"
+                f"Connection reasoning: {reasoning}"
+            )
+
+        prompt = (
+            "For each outside-ML paper listed below, write exactly ONE sentence.\n"
+            "The sentence must state the unique result or method that specific paper provides —\n"
+            "not a generic description of the concept.\n"
+            "BAD example: 'Describes the emergence of a Simplex ETF as the geometric limit of feature vectors.'\n"
+            "GOOD example: 'Provides the first constructive method for generating ETFs from Steiner systems, "
+            "giving ML researchers a direct way to construct the exact symmetric arrangement neural collapse "
+            "converges to.'\n\n"
+            "Respond in this exact format for each paper:\n"
+            "PAPER [arxiv_id]: [one sentence]\n\n"
+            "Papers:\n" + "\n\n".join(paper_lines)
+        )
+        raw = call_llm(prompt, timeout=60, temperature=0.3)
+        result: dict[str, str] = {}
+        for m in re.finditer(r"PAPER (\S+): (.+)", raw):
+            result[m.group(1)] = m.group(2).strip()
+        return result
+    except Exception:
+        return {}
+
+
+def _write_references_md(
+    out_dir: Path,
+    direct_pairs: list,
+    papers: dict,
+) -> None:
+    """Write references.md — outside-ML papers ranked by connection strength."""
+    summaries = _unique_paper_summaries(direct_pairs, papers)
+
+    def _first_sentence(text: str) -> str:
+        text = (text or "").strip().replace("\n", " ")
+        idx = text.find(". ")
+        return text[:idx + 1] if idx > 0 else text[:200]
+
+    def _cat_name(pb: dict) -> tuple[str, str]:
+        try:
+            cats = json.loads(pb.get("categories", "[]") or "[]")
+            cat = cats[0] if cats else "?"
+        except Exception:
+            cat = "?"
+        prefix = cat.split(".")[0] if cat != "?" else "?"
+        name = _FIELD_NAMES.get(cat) or _FIELD_NAMES.get(prefix) or cat
+        return cat, name
+
+    strong = sorted(
+        (p for p in direct_pairs if p.classification == "STRUCTURAL"),
+        key=lambda p: p.similarity, reverse=True,
+    )
+    related = sorted(
+        (p for p in direct_pairs if p.classification in ("METHODOLOGICAL", "THEMATIC")),
+        key=lambda p: p.similarity, reverse=True,
+    )
+
+    seen: set[str] = set()
+    strong_dedup: list = []
+    for p in strong:
+        if p.paper_b not in seen:
+            seen.add(p.paper_b)
+            strong_dedup.append(p)
+    related_dedup: list = []
+    for p in related:
+        if p.paper_b not in seen:
+            seen.add(p.paper_b)
+            related_dedup.append(p)
+
+    def _entry(pair: object) -> list[str]:
+        pb = papers.get(pair.paper_b, {})  # type: ignore[attr-defined]
+        title = pb.get("title") or pair.paper_b  # type: ignore[attr-defined]
+        cat, name = _cat_name(pb)
+        reason = summaries.get(pair.paper_b) or _first_sentence(pair.reasoning_chain)  # type: ignore[attr-defined]
+        return [
+            f"### {title}",
+            f"[arxiv:{pair.paper_b}](https://arxiv.org/abs/{pair.paper_b}) · {name} ({cat})",  # type: ignore[attr-defined]
+            "",
+            reason,
+            "",
+        ]
+
+    lines: list[str] = [
+        "# References",
+        "",
+        "Outside-ML papers found in this run, ranked by connection strength.",
+        "",
+    ]
+    if strong_dedup:
+        lines.append("## Strong Connections")
+        lines.append("")
+        for pair in strong_dedup:
+            lines.extend(_entry(pair))
+    if related_dedup:
+        lines.append("## Related Connections")
+        lines.append("")
+        for pair in related_dedup:
+            lines.extend(_entry(pair))
+    if not strong_dedup and not related_dedup:
+        lines.append("*No cross-domain connections were found in this run.*")
+        lines.append("")
+
+    (out_dir / "references.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 def _write_bridge_map(
@@ -710,6 +856,7 @@ def _write_bridge_map(
         nodes.append({
             "id": pid,
             "title": (p.get("title") or pid)[:80],
+            "full_title": p.get("title") or pid,
             "category": primary,
             "bridge_count": min(bridge_counts.get(pid, 0), 5),
         })
@@ -744,6 +891,7 @@ def _write_bridge_map(
                     nodes.append({
                         "id": pid,
                         "title": (p.get("title") or pid)[:80],
+                        "full_title": p.get("title") or pid,
                         "category": primary,
                         "bridge_count": 1,
                     })
@@ -760,4 +908,4 @@ def _write_bridge_map(
 
     graph_data = {"nodes": nodes, "links": links}
     html = _BRIDGE_MAP_TEMPLATE.replace("GRAPH_DATA", json.dumps(graph_data))
-    (out_dir / "bridge_map.html").write_text(html, encoding="utf-8")
+    (out_dir / "connection_map.html").write_text(html, encoding="utf-8")

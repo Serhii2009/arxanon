@@ -39,6 +39,8 @@ dependencies = [
     "click>=8.1.0",
     "hdbscan>=0.8.33",
     "ollama>=0.5.0",
+    "prompt_toolkit>=3.0.0",
+    "questionary>=2.0.0",
 ]
 
 [project.optional-dependencies]
