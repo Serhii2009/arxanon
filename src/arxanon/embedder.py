@@ -34,13 +34,14 @@ class Embedder:
         return config.EMBED_DIMS.get(self.model_name, 768)
 
     def _load(self) -> None:
-        from sentence_transformers import SentenceTransformer
-
         os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+        os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
         logging.getLogger("transformers").setLevel(logging.ERROR)
         logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+
+        from sentence_transformers import SentenceTransformer
 
         logger.info("Loading embedding model: %s", self.model_name)
         self._model = SentenceTransformer(self.model_name, trust_remote_code=True)

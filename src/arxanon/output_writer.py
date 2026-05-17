@@ -69,6 +69,12 @@ def _reasoning_is_surface_only(pair: "BridgePair") -> bool:
     return (
         "do not share a common mathematical mechanism" in r
         or "they only share the surface-level term" in r
+        or "simply use the word" in r
+        or "only share the" in r
+        or "no shared mathematical" in r
+        or "merely share the" in r
+        or "different contexts" in r
+        or "fundamentally different" in r
     )
 
 
@@ -615,10 +621,12 @@ const g = svg.append("g");
 svg.call(d3.zoom().scaleExtent([0.15, 5]).on("zoom", e => g.attr("transform", e.transform)));
 
 const sim = d3.forceSimulation(graph.nodes)
-  .force("link", d3.forceLink(graph.links).id(d => d.id).distance(140).strength(0.25))
-  .force("charge", d3.forceManyBody().strength(-400))
+  .force("link", d3.forceLink(graph.links).id(d => d.id).distance(180).strength(0.25))
+  .force("charge", d3.forceManyBody().strength(-600))
   .force("center", d3.forceCenter(W / 2, H / 2))
-  .force("collision", d3.forceCollide(18));
+  .force("collision", d3.forceCollide(18))
+  .force("x", d3.forceX().x(d => W / 2 + (Math.random() - 0.5) * W * 0.6).strength(0.04))
+  .force("y", d3.forceY(H / 2).strength(0.02));
 
 const link = g.append("g").selectAll("line")
   .data(graph.links).join("line")
@@ -650,6 +658,16 @@ node.append("circle")
   .style("stroke", "#1e2030")
   .style("stroke-width", 1.5);
 
+node.append("text")
+  .attr("class", "arxiv-label")
+  .attr("x", d => 7 + (d.bridge_count||0)*2)
+  .attr("y", 4)
+  .style("font-size", "10px")
+  .style("fill", "#666")
+  .style("opacity", 0)
+  .style("pointer-events", "none")
+  .text(d => d.id);
+
 const tip = d3.select("#tooltip");
 node.on("mouseover", (e, d) => {
   const connected = new Set([d.id]);
@@ -660,6 +678,8 @@ node.on("mouseover", (e, d) => {
     if (tid === d.id) connected.add(sid);
   });
   node.style("opacity", n => connected.has(n.id) ? 1 : 0.08);
+  node.select(".arxiv-label")
+    .style("opacity", n => connected.has(n.id) ? 1 : 0);
   link.style("stroke-opacity", l => {
     const sid = l.source.id !== undefined ? l.source.id : l.source;
     const tid = l.target.id !== undefined ? l.target.id : l.target;
@@ -676,6 +696,7 @@ node.on("mouseover", (e, d) => {
   tip.style("left",(e.pageX+14)+"px").style("top",(e.pageY-10)+"px");
 }).on("mouseout", () => {
   node.style("opacity", 1);
+  node.select(".arxiv-label").style("opacity", 0);
   link.style("stroke-opacity", l => l.classification ? 0.65 : 0.15);
   tip.style("display","none");
 });

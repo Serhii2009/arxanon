@@ -14,7 +14,7 @@ import logging
 import click
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+from rich.progress import BarColumn, Progress, ProgressColumn, SpinnerColumn, TaskProgressColumn, TextColumn
 from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
@@ -34,13 +34,44 @@ from .clusters import BridgePipelineResult
 console = Console(legacy_windows=False)
 
 
+class _BlockBarColumn(ProgressColumn):
+    BAR_WIDTH = 30
+
+    def render(self, task):
+        if task.total is None:
+            return Text("░" * self.BAR_WIDTH, style="dim purple")
+        pct = task.percentage / 100.0
+        filled = int(self.BAR_WIDTH * pct)
+        color = "green" if task.finished else "purple"
+        return Text("▓" * filled + "░" * (self.BAR_WIDTH - filled), style=color)
+
+
+class _PurplePctColumn(ProgressColumn):
+    def render(self, task):
+        if task.total is None:
+            return Text("", style="dim")
+        return Text(f"{int(task.percentage):3d}%", style="purple")
+
+
+class _ETAColumn(ProgressColumn):
+    def render(self, task):
+        if task.finished:
+            return Text("done", style="dim")
+        remaining = task.time_remaining
+        if remaining is None:
+            return Text("?", style="dim")
+        if remaining < 60:
+            return Text(f"~{int(remaining)}s", style="dim")
+        return Text(f"~{int(remaining // 60)}m {int(remaining % 60)}s", style="dim")
+
+
 def _header() -> None:
     model_label = config.EMBED_MODEL.split("/")[-1]
     header = Text.assemble(
-        ("A R X A N O N", "bold white"),
+        ("A R X A N O N", "bold bright_white"),
         (f"  v{__version__}", "dim white"),
         "\n",
-        ("Cross-Domain Structural Analogy Engine", "dim cyan"),
+        ("Cross-domain research engine for AI/ML", "cyan"),
     )
     console.print(
         Panel(
@@ -521,19 +552,17 @@ def execute_pipeline(
 
     with console.status("[cyan]Gemma is identifying relevant ML papers…[/cyan]"):
         sem_queries = _gemma_expand_queries(query)
-    console.print(
-        "  [green]✓[/green] ML queries     "
-        + "[bold dim]" + " | ".join(f'"{q}"' for q in sem_queries) + "[/bold dim]"
-    )
-
     # structural queries are regenerated from scratch for each pipeline call — no cross-run state
     with console.status("[cyan]Translating to physics and math vocabulary…[/cyan]"):
         str_queries = _llm_structural_queries(query, sem_queries)
-    if str_queries:
-        console.print(
-            "  [green]✓[/green] Physics vocab  "
-            + "[bold dim]" + " | ".join(f'"{q}"' for q in str_queries) + "[/bold dim]"
-        )
+    _query_table = Table(box=None, show_header=True, padding=(0, 2))
+    _query_table.add_column("ML search", style="dim italic")
+    _query_table.add_column("Structural vocabulary", style="dim italic")
+    for _i in range(max(len(sem_queries), len(str_queries))):
+        _ml = f'"{sem_queries[_i]}"' if _i < len(sem_queries) else ""
+        _st = f'"{str_queries[_i]}"' if _i < len(str_queries) else ""
+        _query_table.add_row(_ml, _st)
+    console.print(_query_table)
     structural_query_map: dict[str, str] = {
         f"str{i + 1}": q for i, q in enumerate(str_queries)
     }
@@ -555,16 +584,18 @@ def execute_pipeline(
 
     console.print()
     console.print("Fetching papers from arXiv…")
+    console.print("[dim]Retrieving papers across ML and structural channels[/dim]")
 
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
+        _BlockBarColumn(),
+        _PurplePctColumn(),
+        _ETAColumn(),
         console=console,
-        transient=False,
+        transient=True,
     ) as progress:
-        task_a = progress.add_task("[cyan]Searching arXiv...[/cyan]", total=max_results)
+        task_a = progress.add_task("[cyan]Searching arXiv…[/cyan]", total=max_results)
 
         for i, q in enumerate(sem_queries):
             label = q[:55] + "…" if len(q) > 55 else q
@@ -598,15 +629,11 @@ def execute_pipeline(
             str_fetched += count
             total_fetched += count
 
-        sem_str = f"{sem_fetched} semantic"
-        str_str = f", {str_fetched} structural" if str_queries else ""
-        progress.update(
-            task_a,
-            completed=total_fetched,
-            description=f"[green]✓[/green] {total_fetched} papers fetched ({sem_str}{str_str})",
-        )
+        progress.update(task_a, completed=total_fetched)
 
-    console.print()
+    console.print(
+        f"[green]✓[/green] {total_fetched} papers — {sem_fetched} ML · {str_fetched} structural"
+    )
 
     n_cats = get_unique_category_count()
     n_queries = len(sem_queries) + len(str_queries)
@@ -616,6 +643,7 @@ def execute_pipeline(
     # ── Phase 1, Stage 2: Citation graph ──────────────────────────────────────
     console.print()
     console.print("Building citation network…")
+    console.print("[dim]Mapping connections between papers via Semantic Scholar[/dim]")
 
     from .db import get_all_arxiv_ids
 
@@ -634,46 +662,51 @@ def execute_pipeline(
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
+        _BlockBarColumn(),
+        _PurplePctColumn(),
+        _ETAColumn(),
         console=console,
-        transient=False,
+        transient=True,
     ) as progress:
         task_c = progress.add_task("[cyan]Building citation graph…[/cyan]", total=len(all_ids))
 
         def _on_citation(done: int, total: int) -> None:
-            desc = "Building citation graph…"
+            desc = "[cyan]Building citation graph…[/cyan]"
             if _rate_limited:
                 desc += " [yellow][rate limited, retrying][/yellow]"
             progress.update(task_c, completed=done, total=total, description=desc)
 
         fetch_and_store_citations(all_ids, on_paper=_on_citation)
-        progress.update(task_c, description="[green]✓[/green] Citation graph complete")
 
     logging.getLogger("arxanon.semantic_scholar").removeHandler(_rl_handler)
-    console.print()
-
     edge_counts = get_citation_edge_count()
+    console.print(
+        f"[green]✓[/green] Citation graph — "
+        f"{edge_counts.get('direct', 0)} direct · {edge_counts.get('cocitation', 0)} co-citation edges"
+    )
     if verbose:
         _citation_panel(edge_counts.get("direct", 0), edge_counts.get("cocitation", 0))
 
     # ── Phase 1, Stage 3: Embeddings ──────────────────────────────────────────
     console.print()
     console.print("Computing embeddings…")
+    console.print("[dim]Indexing papers by semantic similarity[/dim]")
 
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
+        _BlockBarColumn(),
+        _PurplePctColumn(),
+        _ETAColumn(),
         console=console,
-        transient=False,
+        transient=True,
     ) as progress:
         task_e = progress.add_task(
-            f"[cyan]Encoding with {config.EMBED_MODEL.split('/')[-1]}...[/cyan]"
+            f"[cyan]Encoding with {config.EMBED_MODEL.split('/')[-1]}…[/cyan]"
         )
         index_size, _query_vector = embed_and_index_papers(query)
-        progress.update(
-            task_e, description=f"[green]✓[/green] {index_size} vectors indexed"
-        )
 
-    console.print()
+    console.print(f"[green]✓[/green] {index_size} papers indexed")
 
     if verbose:
         _embedding_panel(index_size, config.EMBED_MODEL)
@@ -693,10 +726,13 @@ def execute_pipeline(
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
+        _BlockBarColumn(),
+        _PurplePctColumn(),
+        _ETAColumn(),
         console=console,
         transient=True,
     ) as progress:
-        task_br = progress.add_task("[cyan]Computing bibcoupling edges...[/cyan]")
+        task_br = progress.add_task("[cyan]Computing bibcoupling edges…[/cyan]")
 
         def _on_bridge_stage(stage: str, value: object) -> None:
             if stage == "bibcoupling_done":
@@ -758,6 +794,7 @@ def execute_pipeline(
     if not no_gemma:
         console.print()
         console.print("Validating cross-domain pairs with Gemma…")
+        console.print("[dim]Evaluating structural correspondence between ML and outside-ML paper pairs[/dim]")
 
         _bridge_edges_total = sum(
             len(c.bridge_edges) for c in bridge_result.clusters[:top_clusters]
@@ -767,13 +804,14 @@ def execute_pipeline(
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
+            _BlockBarColumn(),
+            _PurplePctColumn(),
+            _ETAColumn(),
             console=console,
-            transient=False,
+            transient=True,
         ) as progress:
             task_g = progress.add_task(
-                "[cyan]Checking Ollama...[/cyan]",
+                "[cyan]Checking Ollama…[/cyan]",
                 total=max(total_pairs_estimate, 1),
             )
 
@@ -782,7 +820,7 @@ def execute_pipeline(
                     task_g,
                     completed=done,
                     total=total,
-                    description=f"[cyan]Verifying bridge {done}/{total}...[/cyan]",
+                    description=f"[cyan]Validating pairs  {done}/{total}[/cyan]",
                 )
 
             bridge_result = run_gemma_validation(
@@ -792,12 +830,12 @@ def execute_pipeline(
                 max_validate=max_validate,
                 on_pair=_on_pair,
             )
-            if bridge_result.gemma_available:
-                progress.update(task_g, description="[green]✓[/green] Validation complete")
-            else:
-                progress.update(task_g, description="[yellow]~[/yellow] Ollama unavailable")
 
-        console.print()
+        _all_validated = [p for c in bridge_result.clusters for p in c.validated_pairs]
+        if bridge_result.gemma_available:
+            console.print(f"[green]✓[/green] Validation complete — {len(_all_validated)} pairs")
+        else:
+            console.print("[yellow]⚠[/yellow] Ollama unavailable — bridges shown unvalidated")
 
         if verbose:
             _gemma_validation_panel(bridge_result)
@@ -805,23 +843,26 @@ def execute_pipeline(
     # ── Phase 3b: Direct cross-domain validation (bypasses similarity threshold) ─
     if not no_gemma:
         console.print()
+        console.print("Running direct cross-domain comparison…")
+        console.print("[dim]Comparing semantic and structural channel papers directly[/dim]")
 
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
+            _BlockBarColumn(),
+            _PurplePctColumn(),
+            _ETAColumn(),
             console=console,
-            transient=False,
+            transient=True,
         ) as progress:
-            task_d = progress.add_task("[cyan]Finding cross-channel pairs...[/cyan]", total=50)
+            task_d = progress.add_task("[cyan]Finding cross-channel pairs…[/cyan]", total=50)
 
             def _on_direct_pair(done: int, total: int) -> None:
                 progress.update(
                     task_d,
                     completed=done,
                     total=total,
-                    description=f"[cyan]Direct comparison {done}/{total}...[/cyan]",
+                    description=f"[cyan]Direct comparison {done}/{total}…[/cyan]",
                 )
 
             bridge_result = run_direct_cross_domain_validation(
@@ -832,17 +873,12 @@ def execute_pipeline(
                 structural_query_map=structural_query_map,
                 original_query=query,
             )
-            n_direct = len(bridge_result.direct_cross_domain_pairs)
-            if n_direct:
-                progress.update(
-                    task_d,
-                    description=f"[green]✓[/green] {n_direct} cross-domain pair(s) validated",
-                )
-            else:
-                progress.update(
-                    task_d,
-                    description="[dim]No cross-domain pairs found via direct comparison[/dim]",
-                )
+
+        n_direct = len(bridge_result.direct_cross_domain_pairs)
+        if n_direct:
+            console.print(f"[green]✓[/green] {n_direct} cross-domain pair(s)")
+        else:
+            console.print("[dim]✗ No direct pairs[/dim]")
 
         if verbose and bridge_result.direct_cross_domain_pairs:
             _direct_pairs_panel(bridge_result.direct_cross_domain_pairs, papers_embedded)

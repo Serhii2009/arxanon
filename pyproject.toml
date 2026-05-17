@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "arxanon"
-version = "0.1.0"
+version = "1.0.0"
 description = "Cross-domain structural analogy discovery engine for AI/ML researchers"
 readme = "README.md"
 license = { file = "LICENSE" }

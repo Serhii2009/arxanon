@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Optional
@@ -564,6 +565,16 @@ def _print_result_panel(
     )
 
 
+def _convert_synthesis_to_rich(text: str) -> str:
+    text = re.sub(r'\*\*(.+?)\*\*', r'[bold]\1[/bold]', text)
+    text = re.sub(r'\*([^*]+?)\*', r'[italic]\1[/italic]', text)
+    text = re.sub(r'\$([^$]+?)\$', r'[bold cyan]\1[/bold cyan]', text)
+    text = re.sub(r'\[GROUNDED: (arxiv:\S+?)\]', r'[dim green][\1][/dim green]', text)
+    text = re.sub(r'\[INFERRED\]', r'[dim yellow][INFERRED][/dim yellow]', text)
+    text = re.sub(r'\[SPECULATIVE\]', r'[dim red][SPECULATIVE][/dim red]', text)
+    return text
+
+
 def _gemma_synthesis_panel(
     query: str,
     bridge_result: object,
@@ -760,7 +771,7 @@ def _gemma_synthesis_panel(
 
     console.print(
         Panel(
-            gemma_text + f"\n\n[dim]Full analysis → ./{out_dir.name}/[/dim]",
+            _convert_synthesis_to_rich(gemma_text) + f"\n\n[dim]Full analysis → ./{out_dir.name}/[/dim]",
             title="[bold]What I found[/bold]",
             border_style="cyan",
             padding=(0, 2),
@@ -812,10 +823,10 @@ def _print_session_header(console: Console, settings: dict) -> None:
     else:
         llm_label = f"Ollama · {settings['gemma_model']}"
     header = Text.assemble(
-        ("A R X A N O N", "bold white"),
+        ("A R X A N O N", "bold bright_white"),
         (f"  v{__version__}", "dim white"),
         "\n",
-        ("Cross-Domain Structural Analogy Engine", "dim cyan"),
+        ("Cross-domain research engine for AI/ML", "cyan"),
     )
     console.print(Panel(header, border_style="cyan", padding=(0, 2)))
     console.print(
