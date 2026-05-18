@@ -10,6 +10,11 @@ from .db import upsert_paper
 
 logger = logging.getLogger(__name__)
 
+_INTER_QUERY_DELAY = 3.0          # seconds between consecutive queries
+_BACKOFF_DELAYS = [90, 180, 300]  # wait times for successive 429 retries
+
+_last_query_end: float = 0.0      # epoch time the last query finished
+
 
 def _normalize_id(entry_id: str) -> str:
     """Extract canonical arXiv ID (no version suffix) from a full URL or bare ID.
@@ -40,6 +45,12 @@ def fetch_and_store_papers(
     Returns:
         Number of papers stored.
     """
+    global _last_query_end
+    if _last_query_end > 0:
+        gap = time.time() - _last_query_end
+        if gap < _INTER_QUERY_DELAY:
+            time.sleep(_INTER_QUERY_DELAY - gap)
+
     logger.debug("arXiv query [%s]: %r", query_tag, query)
     client = arxiv.Client(
         page_size=min(100, max_results),
@@ -53,7 +64,7 @@ def fetch_and_store_papers(
     )
 
     count = 0
-    for attempt in range(2):
+    for attempt in range(len(_BACKOFF_DELAYS) + 1):
         try:
             for result in client.results(search):
                 arxiv_id = _normalize_id(result.entry_id)
@@ -74,10 +85,19 @@ def fetch_and_store_papers(
         except Exception as exc:
             status = getattr(exc, "status", None) or getattr(exc, "code", None)
             is_rate_limit = status == 429 or "429" in str(exc) or "rate" in str(exc).lower()
-            if is_rate_limit and attempt == 0:
-                logger.warning("arXiv rate limit (%s); waiting 60 s before retry…", exc)
-                time.sleep(60)
+            if is_rate_limit and attempt < len(_BACKOFF_DELAYS):
+                delay = _BACKOFF_DELAYS[attempt]
+                logger.warning(
+                    "arXiv is rate limiting this connection — waiting %ds before retry"
+                    " (normal for heavy API use)", delay
+                )
+                time.sleep(delay)
             else:
-                logger.warning("arXiv query [%s] failed: %s; using %d papers collected so far", query_tag, exc, count)
+                logger.warning(
+                    "arXiv query [%s] failed: %s; using %d papers collected so far",
+                    query_tag, exc, count,
+                )
                 break
+
+    _last_query_end = time.time()
     return count
