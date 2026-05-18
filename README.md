@@ -171,4 +171,4 @@ The tool adds less value when:
 
 ---
 
-**_Built by [Serhii Kravchenko](https://www.linkedin.com/in/serhii-kravchenko1/) 🔥_**
+**Built by [Serhii Kravchenko](https://www.linkedin.com/in/serhii-kravchenko1/) 🔥**
